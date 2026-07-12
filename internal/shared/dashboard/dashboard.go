@@ -8,6 +8,7 @@ import (
 	"sync"
 
 	"github.com/pterm/pterm"
+	"gwsferry/internal/shared/timer"
 )
 
 // ==========================================
@@ -49,10 +50,18 @@ type Dashboard struct {
 	stuckThreads int
 	generalLogs  []logLine
 	workerLogs   []logLine
+	timer        *timer.Timer
 }
 
 func New() *Dashboard {
-	return &Dashboard{workers: make(map[string]WorkerState)}
+	return &Dashboard{
+		workers: make(map[string]WorkerState),
+		timer:   timer.New(),
+	}
+}
+
+func (d *Dashboard) StartTimer() {
+	d.timer.Start()
 }
 
 func (d *Dashboard) Start() {
@@ -175,10 +184,11 @@ func (d *Dashboard) redraw() {
 	}
 
 	// === Header ===
+	timerStr := d.timer.Render()
 	header := pterm.DefaultHeader.
 		WithBackgroundStyle(pterm.NewStyle(pterm.BgLightBlue)).
 		WithTextStyle(pterm.NewStyle(pterm.FgBlack, pterm.Bold)).
-		Sprintf("Сбор Gmail labelIds [%d%%]", pct)
+		Sprintf("Progress [%d%%]  |  %s", pct, timerStr)
 
 	// === Summary ===
 	summary := fmt.Sprintf(
@@ -201,11 +211,15 @@ func (d *Dashboard) redraw() {
 	})
 	for _, k := range sortedKeys {
 		w := workers[k]
+		eta := w.ETA
+		if eta == "" {
+			eta = "--:--"
+		}
 		rows = append(rows, []string{
 			workerColorStr(w.Status, strings.ToUpper(k)),
 			truncate(w.Task, 28),
 			workerColorStr(w.Status, truncate(w.Status, 24)),
-			w.ETA,
+			eta,
 		})
 	}
 
