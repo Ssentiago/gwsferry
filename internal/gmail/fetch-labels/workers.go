@@ -7,6 +7,7 @@ import (
 	"log"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"gwsferry/internal/gmail/fetch-labels/store"
@@ -39,15 +40,20 @@ func (a *app) bumpError() {
 	})
 }
 
-func (a *app) worker(ctx context.Context, idx int, saKeyPath string, emailCh chan string, requeue chan<- string, wg *sync.WaitGroup) {
+func (a *app) worker(ctx context.Context, idx int, saKeyPath string, emailCh chan string, tasksDone <-chan struct{}, consumed *atomic.Int32, requeue chan<- string, wg *sync.WaitGroup) {
 	defer wg.Done()
 	workerKey := fmt.Sprintf("sa%d", idx)
 
 	stagger := time.Duration(idx) * workerStartStagger
 	if stagger > 0 {
 		a.dash.UpdateWorker(workerKey, "IDLE", fmt.Sprintf("старт через %s", stagger), "")
+		timer := time.NewTimer(stagger)
+		defer timer.Stop()
 		select {
-		case <-time.After(stagger):
+		case <-timer.C:
+		case <-tasksDone:
+			a.dash.UpdateWorker(workerKey, "IDLE", "нет задач", "")
+			return
 		case <-a.shutdown.Done():
 			return
 		}
@@ -72,6 +78,7 @@ func (a *app) worker(ctx context.Context, idx int, saKeyPath string, emailCh cha
 		default:
 			return
 		}
+		consumed.Add(1)
 
 		shortEmail := strings.Split(email, "@")[0]
 

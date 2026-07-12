@@ -94,7 +94,9 @@ func preFetchMsgIDs(ctx context.Context, emails []string, validKeys []string, st
 
 	prefetchArea, _ := pterm.DefaultArea.WithRemoveWhenDone().Start()
 	fetchDoneCh := make(chan struct{})
+	fetchGoroutineDone := make(chan struct{})
 	go func() {
+		defer close(fetchGoroutineDone)
 		ticker := time.NewTicker(200 * time.Millisecond)
 		defer ticker.Stop()
 		for {
@@ -165,6 +167,7 @@ func preFetchMsgIDs(ctx context.Context, emails []string, validKeys []string, st
 	fetchWg.Wait()
 	time.Sleep(300 * time.Millisecond)
 	close(fetchDoneCh)
+	<-fetchGoroutineDone
 	prefetchArea.Stop()
 	fmt.Print("\033[2J\033[H")
 	os.Stdout.Sync()

@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/signal"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -24,24 +25,24 @@ func Run() {
 	}
 
 	st := store.New(labelsFile)
-	doneCount, partialCount, err := st.Load()
+	loadedCount, err := st.Load()
 	if err != nil {
 		log.Fatalf("[ERROR] Ошибка загрузки %s: %v", labelsFile, err)
 	}
-	pterm.Success.Printfln("Загружено %d готовых юзеров, %d частично собранных из %s", doneCount, partialCount, labelsFile)
-	log.Printf("[INFO] [OK] Загружено %d готовых юзеров, %d частично собранных из %s", doneCount, partialCount, labelsFile)
+	pterm.Success.Printfln("[OK] Loaded %d users from %s", loadedCount, labelsFile)
 
 	shutdown := util.NewShutdownFlag()
-
-	log.Println("[INFO] === СБОР GMAIL LABELIDS ===")
 
 	if _, err := os.Stat(usersJSONPath); err != nil {
 		log.Fatalf("[ERROR] Файл %s не найден.", usersJSONPath)
 	}
+
 	emails, err := loadEmails(usersJSONPath)
 	if err != nil || len(emails) == 0 {
+		pterm.Error.Printfln("Failed to load users.json")
 		log.Fatalln("[ERROR] Нет пользователей в users.json.")
 	}
+	pterm.Success.Printfln("Loaded %d users from %s", len(emails), usersJSONPath)
 
 	allKeys, err := loadServiceAccountKeys(saKeysDir)
 	if err != nil {
@@ -63,22 +64,68 @@ func Run() {
 	preFetchMsgIDs(ctx, emails, validKeys, st, n)
 
 	var pending []string
+	collectedCount := 0
 	for _, e := range emails {
-		if !st.IsUserCollected(e) {
+		if st.IsUserCollected(e) {
+			collectedCount++
+		} else {
 			pending = append(pending, e)
 		}
 	}
-	skipped := len(emails) - len(pending)
 
 	fmt.Println()
-	pterm.DefaultSection.Println("Сводка перед запуском")
-	pterm.Info.Printfln("Всего юзеров:          %d", len(emails))
-	pterm.Info.Printfln("Уже собрано (resume):  %d", skipped)
-	pterm.Info.Printfln("Осталось в очереди:    %d", len(pending))
-	pterm.Info.Printfln("Рабочих воркеров (SA): %d из %d", n, len(allKeys))
-	pterm.Info.Printfln("Результат:             %s", labelsFile)
-	log.Println("[INFO] -- Сводка перед запуском --")
-	log.Printf("[INFO] Всего юзеров: %d, resume: %d, в очереди: %d, воркеров: %d", len(emails), skipped, len(pending), n)
+	pterm.DefaultSection.Println("Summary")
+
+	tableData := [][]string{{"USER", "GOOGLE", "LOCAL", "STATUS"}}
+	for _, e := range emails {
+		google, local := st.UserStats(e)
+		status := pterm.Yellow("pending")
+		if st.IsUserCollected(e) {
+			status = pterm.Green("collected")
+		} else if google == 0 {
+			status = pterm.Red("no data")
+		}
+		tableData = append(tableData, []string{
+			e,
+			fmt.Sprintf("%d", google),
+			fmt.Sprintf("%d", local),
+			status,
+		})
+	}
+
+	tbl, _ := pterm.DefaultTable.
+		WithHasHeader().
+		WithBoxed().
+		WithHeaderRowSeparator("═").
+		WithRowSeparator("─").
+		WithSeparator("│").
+		WithStyle(pterm.NewStyle(pterm.FgLightWhite)).
+		WithHeaderStyle(pterm.NewStyle(pterm.FgLightMagenta, pterm.Bold)).
+		WithData(tableData).
+		Srender()
+	fmt.Println(tbl)
+
+	pterm.Info.Printfln("Workers (SA):  %d of %d", n, len(allKeys))
+	pterm.Info.Printfln("Collected:     %d", collectedCount)
+	pterm.Info.Printfln("Pending:       %d", len(pending))
+	pterm.Info.Printfln("Log file:      gmail_labels_fetch_%s.log", workspacePrefix)
+	pterm.Info.Printfln("Result file:   %s", labelsFile)
+
+	if len(pending) == 0 {
+		pterm.Success.Println("All users collected. Nothing to do.")
+		return
+	}
+
+	result, err := pterm.DefaultInteractiveConfirm.Show("Continue?")
+	if err != nil {
+		pterm.Warning.Printfln("Input error: %v — aborting.", err)
+		return
+	}
+	if !result {
+		pterm.Warning.Println("Cancelled by user.")
+		return
+	}
+	fmt.Println()
 
 	var dumperWg sync.WaitGroup
 	dumperWg.Add(1)
@@ -102,10 +149,11 @@ func Run() {
 
 	dash := dashboard.New()
 	dash.Start()
+	dash.StartTimer()
 	defer dash.Stop()
 	dash.UpdateOverall(func(o *dashboard.OverallState) {
 		o.UsersTotal = len(emails)
-		o.UsersDone = skipped
+		o.UsersDone = collectedCount
 		o.UsersPending = len(pending)
 	})
 
@@ -141,13 +189,23 @@ func Run() {
 		emailCh <- e
 	}
 	close(emailCh)
+
+	var consumed atomic.Int32
+	tasksDone := make(chan struct{})
+	go func() {
+		for int(consumed.Load()) < len(pending) {
+			time.Sleep(100 * time.Millisecond)
+		}
+		close(tasksDone)
+	}()
+
 	requeue := make(chan string, len(pending))
 
 	start := time.Now()
 	var wg sync.WaitGroup
 	for i := 0; i < n; i++ {
 		wg.Add(1)
-		go a.worker(ctx, i, validKeys[i], emailCh, requeue, &wg)
+		go a.worker(ctx, i, validKeys[i], emailCh, tasksDone, &consumed, requeue, &wg)
 	}
 
 	wg.Wait()
@@ -166,15 +224,18 @@ func Run() {
 
 	elapsed := time.Since(start)
 	if err := st.Save(); err != nil {
-		log.Printf("[WARN] [DUMP] финальный дамп не удался: %v", err)
+		log.Printf("[WARN] [DUMP] final dump failed: %v", err)
 	}
 
 	fmt.Println()
 	if len(requeued) > 0 {
-		pterm.Warning.Printfln("=== ЗАВЕРШЕНО за %s, %d юзеров ждут следующего запуска (суточная квота) ===", elapsed, len(requeued))
-		log.Printf("[INFO] === ЗАВЕРШЕНО за %s ===", elapsed)
+		pterm.Warning.Printfln("=== STOPPED in %s, %d users pending (daily quota) ===", elapsed, len(requeued))
 	} else {
-		pterm.Success.Printfln("=== СБОР LABELIDS ЗАВЕРШЁН за %s ===", elapsed)
-		log.Printf("[INFO] === СБОР LABELIDS ЗАВЕРШЁН за %s ===", elapsed)
+		pterm.Success.Printfln("=== LABEL IDS EXPORT COMPLETED in %s ===", elapsed)
 	}
+	pterm.Info.Printfln("Result saved to:     %s", labelsFile)
+	pterm.Info.Printfln("Log file:            gmail_labels_fetch_%s.log", workspacePrefix)
+
+	fmt.Print("\033[0m")
+	os.Stdout.Sync()
 }
