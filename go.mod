@@ -1,8 +1,9 @@
-module gmail-labels
+module gwsferry
 
 go 1.25.0
 
 require (
+	github.com/AlecAivazis/survey/v2 v2.3.7
 	github.com/pterm/pterm v0.12.83
 	golang.org/x/oauth2 v0.21.0
 	google.golang.org/api v0.187.0
@@ -15,7 +16,6 @@ require (
 	cloud.google.com/go/auth v0.6.1 // indirect
 	cloud.google.com/go/auth/oauth2adapt v0.2.2 // indirect
 	cloud.google.com/go/compute/metadata v0.3.0 // indirect
-	github.com/AlecAivazis/survey/v2 v2.3.7 // indirect
 	github.com/clipperhouse/uax29/v2 v2.7.0 // indirect
 	github.com/containerd/console v1.0.5 // indirect
 	github.com/felixge/httpsnoop v1.0.4 // indirect
