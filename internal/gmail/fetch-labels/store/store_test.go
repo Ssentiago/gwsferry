@@ -13,27 +13,22 @@ func TestLoad_NewFormat(t *testing.T) {
 	data := `{
 		"user1@test.com": {
 			"messages": {"msg1": ["Label_1"], "msg2": ["Label_2"]},
-			"label_names": {"Label_1": "Inbox"},
-			"done": true
+			"label_names": {"Label_1": "Inbox"}
 		},
 		"user2@test.com": {
 			"messages": {"msg3": ["Label_3"]},
-			"label_names": {},
-			"done": false
+			"label_names": {}
 		}
 	}`
 	os.WriteFile(path, []byte(data), 0644)
 
 	st := New(path)
-	done, partial, err := st.Load()
+	count, err := st.Load()
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	if done != 1 {
-		t.Errorf("done=%d, want 1", done)
-	}
-	if partial != 1 {
-		t.Errorf("partial=%d, want 1", partial)
+	if count != 2 {
+		t.Errorf("count=%d, want 2", count)
 	}
 
 	// Проверяем данные.
@@ -53,12 +48,12 @@ func TestLoad_NewFormat(t *testing.T) {
 
 func TestLoad_NoFile(t *testing.T) {
 	st := New("/nonexistent/labels.json")
-	done, partial, err := st.Load()
+	count, err := st.Load()
 	if err != nil {
 		t.Fatalf("Load nonexistent: %v", err)
 	}
-	if done != 0 || partial != 0 {
-		t.Errorf("done=%d partial=%d, want 0,0", done, partial)
+	if count != 0 {
+		t.Errorf("count=%d, want 0", count)
 	}
 }
 
@@ -77,16 +72,12 @@ func TestSaveAndLoad(t *testing.T) {
 
 	// Загружаем заново.
 	st2 := New(path)
-	done, partial, err := st2.Load()
+	count, err := st2.Load()
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	// FinalizeUser не ставит done=true — готовность через IsUserCollected.
-	if done != 0 {
-		t.Errorf("done=%d, want 0", done)
-	}
-	if partial != 1 {
-		t.Errorf("partial=%d, want 1", partial)
+	if count != 1 {
+		t.Errorf("count=%d, want 1", count)
 	}
 
 	cached := st2.CachedLabels("user@test.com")
@@ -113,17 +104,40 @@ func TestIsUserCollected(t *testing.T) {
 		t.Error("expected collected (2/2)")
 	}
 
-	// Нет индекса — fallback на done.
+	// Нет индекса — считаем несобранным.
 	st2 := New(path)
 	st2.mu.Lock()
-	st2.data["fallback@test.com"] = &User{
+	st2.data["noidx@test.com"] = &User{
 		Messages:   map[string][]string{"msg1": {"L1"}},
 		LabelNames: map[string]string{},
-		Done:       true,
 	}
 	st2.mu.Unlock()
-	if !st2.IsUserCollected("fallback@test.com") {
-		t.Error("expected collected (done=true fallback)")
+	if st2.IsUserCollected("noidx@test.com") {
+		t.Error("expected not collected (no index)")
+	}
+}
+
+func TestUserStats(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "labels.json")
+
+	st := New(path)
+	st.SaveMsgLabels("user@test.com", "msg1", []string{"L1"})
+	st.SaveMsgLabels("user@test.com", "msg2", []string{"L2"})
+	st.SetMsgIndex("user@test.com", []string{"msg1", "msg2", "msg3"})
+
+	google, local := st.UserStats("user@test.com")
+	if google != 3 {
+		t.Errorf("google=%d, want 3", google)
+	}
+	if local != 2 {
+		t.Errorf("local=%d, want 2", local)
+	}
+
+	// Нет данных.
+	google, local = st.UserStats("unknown@test.com")
+	if google != 0 || local != 0 {
+		t.Errorf("unknown: google=%d local=%d, want 0,0", google, local)
 	}
 }
 

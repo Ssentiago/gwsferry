@@ -2,18 +2,13 @@
 // labelIds на диске и за resume-логику НА УРОВНЕ КОНКРЕТНОГО msg_id.
 //
 // Структура записи юзера в файле: {"messages": {msg_id: [labelIds]},
-// "label_names": {labelId: name}, "done": bool}. Каждый msg_id пишется
+// "label_names": {labelId: name}}. Каждый msg_id пишется
 // в "messages" сразу по получении ответа от API (см. SaveMsgLabels),
 // не дожидаясь завершения всего ящика - периодический дамп на диск
 // сохраняет и частично собранных юзеров.
 //
-// Конкурентная гонка: если снапшотить map и мутировать вложенные map'ы
-// (User.Messages) из других горутин ПОКА снапшот ещё сериализуется в
-// json.Marshal - data race, которую -race поймает. Поэтому снапшот
-// делается под мьютексом С ГЛУБОКИМ КОПИРОВАНИЕМ вложенных map'ов
-// (deepCopy). Запись файла сериализована отдельным мьютексом (fileMu),
-// чтобы периодический дампер и финальный дамп в main() не писали в
-// один и тот же .tmp-файл одновременно.
+// Единственный источник истины для "собран/не собран" — сравнение
+// количества локальных msg_id с количеством из Google (msgIndex).
 package store
 
 import (
@@ -27,7 +22,6 @@ import (
 type User struct {
 	Messages   map[string][]string `json:"messages"`
 	LabelNames map[string]string   `json:"label_names"`
-	Done       bool                `json:"done"`
 }
 
 // Store - потокобезопасное хранилище результата с персистентностью на
@@ -45,20 +39,19 @@ func New(path string) *Store {
 	return &Store{path: path, data: make(map[string]*User)}
 }
 
-// Load читает уже собранные лейблы с диска. Формат файла:
-// {email: {"messages": {msg_id: [labelIds]}, "label_names": {id: name}, "done": bool}}.
-func (s *Store) Load() (doneCount, partialCount int, err error) {
+// Load читает уже собранные лейблы с диска.
+func (s *Store) Load() (count int, err error) {
 	raw, err := os.ReadFile(s.path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return 0, 0, nil
+			return 0, nil
 		}
-		return 0, 0, fmt.Errorf("чтение %s: %w", s.path, err)
+		return 0, fmt.Errorf("чтение %s: %w", s.path, err)
 	}
 
 	var rawTop map[string]json.RawMessage
 	if err := json.Unmarshal(raw, &rawTop); err != nil {
-		return 0, 0, fmt.Errorf("парсинг %s: %w", s.path, err)
+		return 0, fmt.Errorf("парсинг %s: %w", s.path, err)
 	}
 
 	data := make(map[string]*User, len(rawTop))
@@ -66,10 +59,9 @@ func (s *Store) Load() (doneCount, partialCount int, err error) {
 		var u struct {
 			Messages   map[string][]string `json:"messages"`
 			LabelNames map[string]string   `json:"label_names"`
-			Done       bool                `json:"done"`
 		}
 		if err := json.Unmarshal(rawUser, &u); err != nil {
-			return 0, 0, fmt.Errorf("парсинг записи для %s: %w", email, err)
+			return 0, fmt.Errorf("парсинг записи для %s: %w", email, err)
 		}
 		if u.Messages == nil {
 			u.Messages = make(map[string][]string)
@@ -80,7 +72,6 @@ func (s *Store) Load() (doneCount, partialCount int, err error) {
 		data[email] = &User{
 			Messages:   u.Messages,
 			LabelNames: u.LabelNames,
-			Done:       u.Done,
 		}
 	}
 
@@ -88,14 +79,7 @@ func (s *Store) Load() (doneCount, partialCount int, err error) {
 	s.data = data
 	s.mu.Unlock()
 
-	for _, u := range data {
-		if u.Done {
-			doneCount++
-		} else {
-			partialCount++
-		}
-	}
-	return doneCount, partialCount, nil
+	return len(data), nil
 }
 
 // deepCopy - полное копирование map[string]*User включая вложенные
@@ -114,16 +98,12 @@ func deepCopy(src map[string]*User) map[string]*User {
 		for k, v := range u.LabelNames {
 			names[k] = v
 		}
-		dst[email] = &User{Messages: msgs, LabelNames: names, Done: u.Done}
+		dst[email] = &User{Messages: msgs, LabelNames: names}
 	}
 	return dst
 }
 
-// Save делает atomic-дамп всего накопленного результата на диск: пишет
-// во временный файл, fsync, затем rename поверх целевого файла. rename
-// на одной файловой системе атомарен - читатель никогда не увидит
-// частично записанный файл, что бы ни случилось (падение процесса,
-// конкурентный Save).
+// Save делает atomic-дамп всего накопленного результата на диск.
 func (s *Store) Save() error {
 	s.fileMu.Lock()
 	defer s.fileMu.Unlock()
@@ -173,8 +153,7 @@ func (s *Store) CachedLabels(email string) map[string][]string {
 	return out
 }
 
-// CachedLabelNames возвращает label_names для юзера, если они уже были
-// собраны в прошлом прогоне.
+// CachedLabelNames возвращает label_names для юзера.
 func (s *Store) CachedLabelNames(email string) map[string]string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -199,10 +178,7 @@ func (s *Store) getOrCreate(email string) *User {
 }
 
 // SaveMsgLabels пишет labelIds ОДНОГО письма в общий результат сразу по
-// получении - не ждёт финализации юзера. Это и даёт гранулярность
-// resume по msg_id: даже если процесс упадёт посреди батча, всё, что
-// уже долетело до этой функции, переживёт следующий периодический дамп
-// на диск.
+// получении - не ждёт финализации юзера.
 func (s *Store) SaveMsgLabels(email, msgID string, labelIDs []string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -210,8 +186,7 @@ func (s *Store) SaveMsgLabels(email, msgID string, labelIDs []string) {
 	u.Messages[msgID] = labelIDs
 }
 
-// FinalizeUser сохраняет label_names для юзера. Не выставляет done=true —
-// готовность определяется динамически через IsUserCollected.
+// FinalizeUser сохраняет label_names для юзера.
 func (s *Store) FinalizeUser(email string, labelNames map[string]string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -278,23 +253,29 @@ func (s *Store) LoadMsgIndex(path string) error {
 	return nil
 }
 
-// IsUserCollected проверяет, собраны ли ВСЕ ожидаемые msg_id для юзера.
-// Сравнивает количество собранных с количеством ожидаемых из msgIndex.
-// Если msgIndex пуст — fallback на старый done-флаг.
+// IsUserCollected проверяет, что ВСЕ msg_id из Google есть локально.
+// Каждый ID из msgIndex должен присутствовать в Messages.
+// Лишние локальные ID не мешают.
 func (s *Store) IsUserCollected(email string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	expected, hasIndex := s.msgIndex[email]
-	u, hasData := s.data[email]
-
-	// Если индекс есть — сравниваем количество.
-	if hasIndex && hasData {
-		return len(u.Messages) >= len(expected)
+	if !hasIndex {
+		return false
 	}
 
-	// Fallback: старый done-флаг.
-	return hasData && u.Done
+	u, hasData := s.data[email]
+	if !hasData {
+		return false
+	}
+
+	for _, id := range expected {
+		if _, ok := u.Messages[id]; !ok {
+			return false
+		}
+	}
+	return true
 }
 
 // ExpectedMsgIDs возвращает список ожидаемых msg_id для юзера.
@@ -302,4 +283,17 @@ func (s *Store) ExpectedMsgIDs(email string) []string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.msgIndex[email]
+}
+
+// UserStats возвращает статистику для юзера: Google count vs Local count.
+// Если msgIndex не загружен — Google=0.
+func (s *Store) UserStats(email string) (google int, local int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	google = len(s.msgIndex[email])
+	if u, ok := s.data[email]; ok {
+		local = len(u.Messages)
+	}
+	return google, local
 }
