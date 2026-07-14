@@ -8,6 +8,7 @@ import (
 	"github.com/pterm/pterm"
 	gmailcopy "gwsferry/internal/gmail/copy"
 	gmailfetch "gwsferry/internal/gmail/fetch-labels"
+	"gwsferry/internal/gmail/import-yandex"
 	"gwsferry/internal/shared/config"
 )
 
@@ -37,6 +38,10 @@ func main() {
 			gmailfetch.Run()
 		case "gmail-copy":
 			gmailcopy.Run()
+		case "yandex-import":
+			if err := importyandex.RunImport(cfg); err != nil {
+				pterm.Error.Printfln("Ошибка: %v", err)
+			}
 		case "drive":
 			pterm.Warning.Println("Drive — в разработке.")
 		case "init":
@@ -68,6 +73,7 @@ func showMainMenu() string {
 		WithOptions([]string{
 			"Export label IDs to JSON",
 			"Download emails (raw .eml) to S3",
+			"Yandex (Import)",
 			"< Back",
 		}).
 		Show()
@@ -77,6 +83,8 @@ func showMainMenu() string {
 		return "gmail-fetch-labels"
 	case "Download emails (raw .eml) to S3":
 		return "gmail-copy"
+	case "Yandex (Import)":
+		return "yandex-import"
 	default:
 		return "back"
 	}
