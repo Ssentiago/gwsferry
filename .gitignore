@@ -37,3 +37,4 @@ yandex_users.json
 gwsferry
 gwsferry-linux-amd64
 
+__pycache__/
