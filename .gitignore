@@ -34,7 +34,7 @@ gwsferry.toml
 yandex_users.json
 
 # Build artifacts
-gwsferry
-gwsferry-linux-amd64
+/gwsferry
+/gwsferry-linux-amd64
 
 __pycache__/
