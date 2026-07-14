@@ -63,12 +63,12 @@ func NewImapWorker(user yandexapi.User, api *yandexapi.API, clientID, clientSecr
 }
 
 // Append appends one email to IMAP with auto-reconnect and retry.
+// Header injection is handled by imap_client.Append.
 func (w *ImapWorker) Append(ctx context.Context, letter Letter, dateFromHeader time.Time, rawMessage []byte) error {
 	folder := ResolveFolder(letter.LabelIDs, letter.LabelNames)
 	flags := ResolveFlags(letter.LabelIDs)
 	needFlagged := containsStr(flags, `\Flagged`)
 	appendFlags := filterOut(flags, `\Flagged`)
-	enriched := injectMsgIDHeader(rawMessage, letter.MsgID)
 
 	folderCreated := false
 	var lastErr error
@@ -91,7 +91,7 @@ func (w *ImapWorker) Append(ctx context.Context, letter Letter, dateFromHeader t
 		}
 
 		// Try append
-		err := Append(ctx, w.conn, folder, dateFromHeader, enriched, appendFlags, letter.MsgID)
+		err := Append(ctx, w.conn, folder, dateFromHeader, rawMessage, appendFlags, letter.MsgID)
 		if err == nil {
 			// Success — handle \Flagged via STORE
 			if needFlagged {

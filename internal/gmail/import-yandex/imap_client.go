@@ -300,11 +300,19 @@ func Delete(ctx context.Context, c *client.Client, folder string, uid uint32) er
 
 // injectMsgIDHeader adds X-Gwsferry-MsgID to RFC822 headers.
 func injectMsgIDHeader(raw []byte, msgID string) []byte {
-	header := fmt.Sprintf("X-Gwsferry-MsgID: %s\r\n", msgID)
+	header := "\r\n" + fmt.Sprintf("X-Gwsferry-MsgID: %s\r\n", msgID)
+
+	// Ищем разделитель заголовков: \r\n\r\n (RFC 2822) или \n\n (non-standard)
 	idx := bytes.Index(raw, []byte("\r\n\r\n"))
 	if idx == -1 {
+		idx = bytes.Index(raw, []byte("\n\n"))
+	}
+	if idx == -1 {
+		// Ни один разделитель не найден — добавляем в конец
+		log.Printf("[DEBUG] [IMAP] injectMsgIDHeader: header-body separator не найден, добавляю в конец")
 		return append(raw, []byte(header+"\r\n")...)
 	}
+
 	result := make([]byte, 0, len(raw)+len(header))
 	result = append(result, raw[:idx]...)
 	result = append(result, []byte(header)...)
