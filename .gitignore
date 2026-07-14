@@ -29,6 +29,10 @@ go.work.sum
 .idea/
 .mimocode/
 
+# Config (contains secrets)
+gwsferry.toml
+yandex_users.json
+
 # Build artifacts
 gwsferry
 gwsferry-linux-amd64

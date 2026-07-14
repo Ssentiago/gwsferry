@@ -216,7 +216,7 @@ func (d *Dashboard) redraw() {
 			eta = "--:--"
 		}
 		rows = append(rows, []string{
-			workerColorStr(w.Status, strings.ToUpper(k)),
+			workerColorStr(w.Status, k),
 			truncate(w.Task, 28),
 			workerColorStr(w.Status, truncate(w.Status, 24)),
 			eta,
