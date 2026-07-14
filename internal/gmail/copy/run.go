@@ -24,13 +24,17 @@ func Run() {
 	if err == nil {
 		log.SetOutput(&util.SyncFile{F: logf})
 		defer logf.Close()
+		log.Printf("[INFO] [RUN] лог-файл открыт: migration_gmail_multi_sa_ru.log")
 	}
 
+	log.Printf("[INFO] [RUN] загружаю конфиг...")
 	cfg, err := config.Load()
 	if err != nil {
 		pterm.Error.Printfln("Ошибка загрузки конфига: %v", err)
+		log.Printf("[ERROR] [RUN] ошибка загрузки конфига: %v", err)
 		return
 	}
+	log.Printf("[INFO] [RUN] конфиг загружен OK")
 
 	fmt.Println()
 	pterm.DefaultSection.Println("Подготовка Gmail миграции")
@@ -38,10 +42,13 @@ func Run() {
 	rss := getRSSMB()
 	if rss > 0 {
 		pterm.Info.Printfln("RSS: %.0fMB (лимит %dMB)", rss, memoryLimitMB)
+		log.Printf("[DEBUG] [RUN] RSS=%.0fMB (лимит %dMB)", rss, memoryLimitMB)
 	}
 
+	log.Printf("[INFO] [RUN] проверяю файл юзеров: %s", usersJSONPath)
 	if _, err := os.Stat(usersJSONPath); err != nil {
 		pterm.Error.Printfln("Файл %s не найден.", usersJSONPath)
+		log.Printf("[ERROR] [RUN] файл %s не найден", usersJSONPath)
 		return
 	}
 
@@ -67,17 +74,23 @@ func Run() {
 		usageGB[u.Email] = gb
 	}
 
+	log.Printf("[INFO] [RUN] загружаю SA ключи...")
 	allKeys, err := loadServiceAccountKeys()
 	if err != nil {
 		pterm.Error.Println(err)
+		log.Printf("[ERROR] [RUN] загрузка SA ключей: %v", err)
 		return
 	}
+	log.Printf("[INFO] [RUN] найдено %d SA ключей", len(allKeys))
 
 	ctx := context.Background()
+	log.Printf("[INFO] [RUN] проверяю SA...")
 	validKeys := verifyServiceAccounts(ctx, allKeys, emails[0])
 	n := len(validKeys)
+	log.Printf("[INFO] [RUN] SA проверены: %d/%d валидных", n, len(allKeys))
 	if n == 0 {
 		pterm.Error.Println("Нет рабочих сервисных аккаунтов.")
+		log.Printf("[ERROR] [RUN] нет рабочих SA")
 		return
 	}
 	if n > maxConcurrentWorkers {
@@ -85,6 +98,7 @@ func Run() {
 		n = maxConcurrentWorkers
 	}
 
+	log.Printf("[INFO] [RUN] загружаю состояние...")
 	st := loadState()
 	for _, e := range emails {
 		if _, ok := st.Users[e]; !ok {
@@ -140,18 +154,25 @@ func Run() {
 		pterm.Warning.Println("Force rescan — all users will be reprocessed")
 	}
 
+	log.Printf("[INFO] [RUN] summary: total=%d copied=%d pending=%d workers=%d", len(emails), skipped, len(pending), n)
+
+	log.Printf("[INFO] [RUN] ожидание подтверждения...")
 	result, err := pterm.DefaultInteractiveConfirm.Show("Continue?")
 	if err != nil {
 		pterm.Warning.Printfln("Input error: %v — aborting.", err)
+		log.Printf("[WARN] [RUN] ошибка ввода: %v, прерываю", err)
 		return
 	}
 	if !result {
 		pterm.Warning.Println("Cancelled by user.")
+		log.Printf("[INFO] [RUN] отмена пользователем")
 		return
 	}
+	log.Printf("[INFO] [RUN] подтверждено, запускаю...")
 
 	shutdown := util.NewShutdownFlag()
 
+	log.Printf("[INFO] [RUN] запускаю periodic state dumper (interval=%s)", stateDumpInterval)
 	var dumperWg sync.WaitGroup
 	dumperWg.Add(1)
 	go func() {
@@ -178,6 +199,7 @@ func Run() {
 		o.UsersPending = len(pending)
 	})
 
+	log.Printf("[INFO] [RUN] signal handler установлен (SIGINT/SIGTERM/SIGWINCH)")
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM, syscall.SIGWINCH)
 	go func() {
@@ -215,6 +237,7 @@ func Run() {
 	close(emailCh)
 	requeue := make(chan string, len(pending))
 
+	log.Printf("[INFO] [RUN] запускаю %d воркеров для %d юзеров", n, len(pending))
 	start := time.Now()
 	var wg sync.WaitGroup
 	for i := 0; i < n; i++ {
@@ -235,6 +258,7 @@ func Run() {
 	saveState(st)
 
 	elapsed := time.Since(start)
+	log.Printf("[INFO] [RUN] завершено за %s, requeued=%d", elapsed, len(requeued))
 	fmt.Println()
 	if len(requeued) > 0 {
 		pterm.Warning.Printfln("=== STOPPED in %s, %d users pending ===", elapsed, len(requeued))
@@ -267,9 +291,10 @@ func loadServiceAccountKeys() ([]string, error) {
 }
 
 func verifyServiceAccounts(ctx context.Context, keys []string, testEmail string) []string {
+	start := time.Now()
 	fmt.Println()
 	pterm.DefaultSection.Println("Pre-flight проверка сервисных аккаунтов...")
-	log.Println("[INFO] >>> Pre-flight проверка сервисных аккаунтов...")
+	log.Println("[INFO] [RUN] >>> Pre-flight проверка сервисных аккаунтов...")
 	var valid []string
 	for _, key := range keys {
 		name := filepath.Base(key)
@@ -281,12 +306,13 @@ func verifyServiceAccounts(ctx context.Context, keys []string, testEmail string)
 		}
 		if err != nil {
 			pterm.Error.Printfln("%s -> %v", name, err)
-			log.Printf("[ERROR]   [FAIL] %s -> %v", name, err)
+			log.Printf("[ERROR] [RUN] [FAIL] %s -> %v", name, err)
 			continue
 		}
 		pterm.Success.Printfln("%s", name)
-		log.Printf("[INFO]   [OK]   %s", name)
+		log.Printf("[INFO] [RUN] [OK] %s", name)
 		valid = append(valid, key)
 	}
+	log.Printf("[INFO] [RUN] SA проверены: %d/%d валидных (за %s)", len(valid), len(keys), time.Since(start))
 	return valid
 }

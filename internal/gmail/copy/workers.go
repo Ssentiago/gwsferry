@@ -88,6 +88,7 @@ func (a *app) worker(ctx context.Context, idx int, saKeyPath string, emailCh cha
 		svc, err := buildGmailClient(saKeyPath, email)
 		if err != nil {
 			a.dash.Log("ERROR", fmt.Sprintf("[%s] Клиент для %s не собран: %v", workerKey, email, err))
+			log.Printf("[ERROR] [USER] %s: BuildClient для %s: %v", workerKey, email, err)
 			a.bumpError()
 			continue
 		}
@@ -99,6 +100,7 @@ func (a *app) worker(ctx context.Context, idx int, saKeyPath string, emailCh cha
 		})
 		if err != nil {
 			a.dash.Log("ERROR", fmt.Sprintf("[%s] Листинг %s не удался: %v", workerKey, email, err))
+			log.Printf("[ERROR] [USER] %s: ListAllMessageIDs %s: %v", workerKey, email, err)
 			a.bumpError()
 			continue
 		}
@@ -268,10 +270,10 @@ func (a *app) worker(ctx context.Context, idx int, saKeyPath string, emailCh cha
 			for _, line := range errorLog {
 				a.dash.Log("WARN", fmt.Sprintf("[%s] %s: %s", workerKey, email, line))
 			}
-			log.Printf("[ERROR] [%s] %s: завершён с ошибками (%d)", workerKey, email, len(errorLog))
+			log.Printf("[ERROR] [USER] %s: завершён с ошибками (%d), %d/%d скачано", workerKey, len(errorLog), downloaded, len(missing))
 			a.bumpError()
 		} else {
-			log.Printf("[DEBUG] [%s] %s: завершён успешно, %d/%d", workerKey, email, downloaded, len(missing))
+			log.Printf("[INFO] [USER] %s: завершён OK, %d/%d скачано", workerKey, downloaded, len(missing))
 			a.bumpDone()
 		}
 		setUserStatus(a.st, email, status, strings.Join(errorLog, "; "))

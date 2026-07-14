@@ -3,6 +3,7 @@ package copy
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"sync"
 )
@@ -15,15 +16,29 @@ type migrationState struct {
 var stateFileMu sync.Mutex
 
 func loadState() *migrationState {
+	log.Printf("[DEBUG] [STATE] загрузка из %s...", stateFile)
 	s := &migrationState{Users: make(map[string]string)}
 	raw, err := os.ReadFile(stateFile)
 	if err != nil {
+		log.Printf("[DEBUG] [STATE] файл %s не найден, создаю пустой state", stateFile)
 		return s
 	}
 	json.Unmarshal(raw, s)
 	if s.Users == nil {
 		s.Users = make(map[string]string)
 	}
+	if s.Errors == nil {
+		s.Errors = make(map[string]string)
+	}
+	doneCount, errCount := 0, 0
+	for _, status := range s.Users {
+		if status == "done" {
+			doneCount++
+		} else if status == "error" {
+			errCount++
+		}
+	}
+	log.Printf("[INFO] [STATE] загружен из %s: %d юзеров (%d done, %d error)", stateFile, len(s.Users), doneCount, errCount)
 	return s
 }
 
@@ -34,6 +49,7 @@ func saveState(s *migrationState) {
 	tmp := stateFile + ".tmp"
 	os.WriteFile(tmp, data, 0644)
 	os.Rename(tmp, stateFile)
+	log.Printf("[DEBUG] [STATE] сохранён в %s (%d bytes)", stateFile, len(data))
 }
 
 func setUserStatus(s *migrationState, email, status, errorDetail string) {
@@ -44,6 +60,7 @@ func setUserStatus(s *migrationState, email, status, errorDetail string) {
 		}
 		s.Errors[email] = errorDetail
 	}
+	log.Printf("[DEBUG] [STATE] %s: статус → %s", email, status)
 	saveState(s)
 }
 
