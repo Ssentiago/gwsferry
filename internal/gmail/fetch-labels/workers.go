@@ -53,15 +53,19 @@ func (a *app) worker(ctx context.Context, idx int, saKeyPath string, emailCh cha
 		case <-timer.C:
 		case <-tasksDone:
 			a.dash.UpdateWorker(workerKey, "IDLE", "нет задач", "")
+			log.Printf("[DEBUG] [WORKER] %s: нет задач, завершаю", workerKey)
 			return
 		case <-a.shutdown.Done():
+			log.Printf("[DEBUG] [WORKER] %s: shutdown до старта", workerKey)
 			return
 		}
 	}
 	a.dash.UpdateWorker(workerKey, "IDLE", "подключен", "")
+	log.Printf("[INFO] [WORKER] %s: запущен, stagger=%s", workerKey, stagger)
 
 	defer func() {
 		a.dash.UpdateWorker(workerKey, "FINISH", "done", "")
+		log.Printf("[DEBUG] [WORKER] %s: завершён", workerKey)
 	}()
 
 	for {
@@ -84,14 +88,17 @@ func (a *app) worker(ctx context.Context, idx int, saKeyPath string, emailCh cha
 
 		if a.st.IsUserCollected(email) {
 			a.dash.Log("INFO", fmt.Sprintf("[%s] %s: уже собран, пропуск", workerKey, shortEmail))
+			log.Printf("[DEBUG] [WORKER] %s: %s уже собран, пропуск", workerKey, shortEmail)
 			a.bumpDone()
 			continue
 		}
 
 		a.dash.UpdateWorker(workerKey, shortEmail, "получение labelIds...", "")
+		log.Printf("[INFO] [WORKER] %s: начало обработки %s", workerKey, email)
 		svc, err := gmailapi.BuildClient(ctx, saKeyPath, email)
 		if err != nil {
 			a.dash.Log("ERROR", fmt.Sprintf("[%s] Клиент для %s не собран: %v", workerKey, email, err))
+			log.Printf("[ERROR] [WORKER] %s: BuildClient для %s: %v", workerKey, email, err)
 			a.bumpError()
 			continue
 		}
@@ -99,14 +106,17 @@ func (a *app) worker(ctx context.Context, idx int, saKeyPath string, emailCh cha
 		msgIDs := a.st.ExpectedMsgIDs(email)
 		if len(msgIDs) == 0 {
 			a.dash.UpdateWorker(workerKey, shortEmail, "сбор индексов писем...", "")
+			listStart := time.Now()
 			msgIDs, err = gmailapi.ListAllMessageIDs(ctx, svc, email, func(collected, page int) {
 				a.dash.UpdateWorker(workerKey, shortEmail, fmt.Sprintf("индексация: %d писем, стр. %d", collected, page), "")
 			})
 			if err != nil {
 				a.dash.Log("ERROR", fmt.Sprintf("[%s] Листинг %s не удался: %v", workerKey, email, err))
+				log.Printf("[ERROR] [WORKER] %s: ListAllMessageIDs %s: %v (за %s)", workerKey, email, err, time.Since(listStart))
 				a.bumpError()
 				continue
 			}
+			log.Printf("[DEBUG] [WORKER] %s: %s: %d msg_ids (за %s)", workerKey, email, len(msgIDs), time.Since(listStart))
 		}
 
 		total := len(msgIDs)
@@ -114,11 +124,13 @@ func (a *app) worker(ctx context.Context, idx int, saKeyPath string, emailCh cha
 			names, err := gmailapi.FetchLabelNames(ctx, svc, email)
 			if err != nil {
 				a.dash.Log("ERROR", fmt.Sprintf("[%s] %s: labels.list не удался (%v), юзер НЕ помечен как done", workerKey, shortEmail, err))
+				log.Printf("[ERROR] [WORKER] %s: %s: FetchLabelNames: %v", workerKey, email, err)
 				a.bumpError()
 				continue
 			}
 			a.st.FinalizeUser(email, names)
 			a.bumpDone()
+			log.Printf("[INFO] [WORKER] %s: %s: 0 писем, финализация labels", workerKey, email)
 			continue
 		}
 
@@ -142,6 +154,8 @@ func (a *app) worker(ctx context.Context, idx int, saKeyPath string, emailCh cha
 
 		fatalQuota := false
 		var errorLog []string
+
+		log.Printf("[INFO] [WORKER] %s: %s: start batch loop, total=%d, cached=%d, pending=%d", workerKey, shortEmail, total, len(cached), len(pending))
 
 		for len(pending) > 0 && retryRound < maxRetries {
 			if a.shutdown.IsSet() {
@@ -261,11 +275,13 @@ func (a *app) worker(ctx context.Context, idx int, saKeyPath string, emailCh cha
 		names, err := gmailapi.FetchLabelNames(ctx, svc, email)
 		if err != nil {
 			a.dash.Log("ERROR", fmt.Sprintf("[%s] %s: labels.list не удался (%v), юзер НЕ помечен как done", workerKey, shortEmail, err))
+			log.Printf("[ERROR] [WORKER] %s: %s: FetchLabelNames: %v", workerKey, email, err)
 			a.bumpError()
 			continue
 		}
 		a.st.FinalizeUser(email, names)
 		a.bumpDone()
+		log.Printf("[INFO] [WORKER] %s: %s: labels финализированы, done (%d/%d collected)", workerKey, email, collected, total)
 	}
 }
 

@@ -29,9 +29,12 @@ type fetchWorkerState struct {
 }
 
 func preFetchMsgIDs(ctx context.Context, emails []string, validKeys []string, st *store.Store, n int) {
+	start := time.Now()
+	log.Printf("[INFO] [PRE-FETCH] старт: %d юзеров, %d воркеров", len(emails), n)
+
 	tmpMsgIdx, err := os.CreateTemp("", "msg_ids_*.json")
 	if err != nil {
-		log.Fatalf("[ERROR] Создание temp-файла: %v", err)
+		log.Fatalf("[ERROR] [PRE-FETCH] Создание temp-файла: %v", err)
 	}
 	tmpMsgIdxPath := tmpMsgIdx.Name()
 	tmpMsgIdx.Close()
@@ -55,6 +58,7 @@ func preFetchMsgIDs(ctx context.Context, emails []string, validKeys []string, st
 		fetchWg.Add(1)
 		go func(idx int) {
 			defer fetchWg.Done()
+			log.Printf("[DEBUG] [PRE-FETCH] воркер %d запущен", idx)
 
 			for e := range fetchEmailCh {
 				shortEmail := strings.Split(e, "@")[0]
@@ -158,9 +162,10 @@ func preFetchMsgIDs(ctx context.Context, emails []string, validKeys []string, st
 		r := <-fetchResults
 		fetchMu.Lock()
 		if r.err != nil {
-			log.Printf("[WARN] Pre-fetch %s: %v", r.email, r.err)
+			log.Printf("[WARN] [PRE-FETCH] %s: %v", r.email, r.err)
 		} else {
 			st.SetMsgIndex(r.email, r.msgIDs)
+			log.Printf("[DEBUG] [PRE-FETCH] %s: %d msg_ids", r.email, len(r.msgIDs))
 		}
 		fetchMu.Unlock()
 	}
@@ -172,7 +177,9 @@ func preFetchMsgIDs(ctx context.Context, emails []string, validKeys []string, st
 	fmt.Print("\033[2J\033[H")
 	os.Stdout.Sync()
 
+	log.Printf("[INFO] [PRE-FETCH] завершён: %d/%d (за %s)", fetchDoneTotal, fetchTotal, time.Since(start))
+
 	if err := st.SaveMsgIndex(tmpMsgIdxPath); err != nil {
-		log.Printf("[WARN] Сохранение msg_index: %v", err)
+		log.Printf("[WARN] [PRE-FETCH] сохранение msg_index: %v", err)
 	}
 }

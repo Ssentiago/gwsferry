@@ -22,46 +22,58 @@ func Run() {
 	if err == nil {
 		log.SetOutput(&util.SyncFile{F: logf})
 		defer logf.Close()
+		log.Printf("[INFO] [RUN] лог-файл открыт: gmail_labels_fetch_%s.log", workspacePrefix)
 	}
 
+	log.Printf("[INFO] [RUN] загружаю store из %s...", labelsFile)
 	st := store.New(labelsFile)
 	loadedCount, err := st.Load()
 	if err != nil {
-		log.Fatalf("[ERROR] Ошибка загрузки %s: %v", labelsFile, err)
+		log.Fatalf("[ERROR] [RUN] Ошибка загрузки %s: %v", labelsFile, err)
 	}
 	pterm.Success.Printfln("[OK] Loaded %d users from %s", loadedCount, labelsFile)
 
 	shutdown := util.NewShutdownFlag()
 
+	log.Printf("[INFO] [RUN] проверяю файл юзеров: %s", usersJSONPath)
 	if _, err := os.Stat(usersJSONPath); err != nil {
-		log.Fatalf("[ERROR] Файл %s не найден.", usersJSONPath)
+		log.Fatalf("[ERROR] [RUN] Файл %s не найден.", usersJSONPath)
 	}
 
+	log.Printf("[INFO] [RUN] загружаю юзеров из %s...", usersJSONPath)
 	emails, err := loadEmails(usersJSONPath)
 	if err != nil || len(emails) == 0 {
 		pterm.Error.Printfln("Failed to load users.json")
-		log.Fatalln("[ERROR] Нет пользователей в users.json.")
+		log.Fatalln("[ERROR] [RUN] Нет пользователей в users.json.")
 	}
 	pterm.Success.Printfln("Loaded %d users from %s", len(emails), usersJSONPath)
+	log.Printf("[INFO] [RUN] загружено %d юзеров", len(emails))
 
+	log.Printf("[INFO] [RUN] загружаю SA ключи из %s...", saKeysDir)
 	allKeys, err := loadServiceAccountKeys(saKeysDir)
 	if err != nil {
-		log.Fatalf("[ERROR] %v", err)
+		log.Fatalf("[ERROR] [RUN] %v", err)
 	}
+	log.Printf("[INFO] [RUN] найдено %d SA ключей", len(allKeys))
 
 	ctx := context.Background()
+	log.Printf("[INFO] [RUN] проверяю SA на работоспособность...")
 	validKeys := verifyServiceAccounts(ctx, allKeys, emails[0])
 	n := len(validKeys)
+	log.Printf("[INFO] [RUN] SA проверены: %d/%d валидных", n, len(allKeys))
 	if n == 0 {
 		pterm.Error.Println("Нет рабочих сервисных аккаунтов.")
-		log.Fatalln("[ERROR] Нет рабочих сервисных аккаунтов.")
+		log.Fatalln("[ERROR] [RUN] Нет рабочих сервисных аккаунтов.")
 	}
 	if n > maxConcurrentWorkers {
 		validKeys = validKeys[:maxConcurrentWorkers]
 		n = maxConcurrentWorkers
 	}
 
+	log.Printf("[INFO] [RUN] pre-fetch msg_ids для %d юзеров, %d воркеров...", len(emails), n)
+	preFetchStart := time.Now()
 	preFetchMsgIDs(ctx, emails, validKeys, st, n)
+	log.Printf("[INFO] [RUN] pre-fetch завершён за %s", time.Since(preFetchStart))
 
 	var pending []string
 	collectedCount := 0
@@ -72,6 +84,7 @@ func Run() {
 			pending = append(pending, e)
 		}
 	}
+	log.Printf("[INFO] [RUN] collected=%d pending=%d", collectedCount, len(pending))
 
 	fmt.Println()
 	pterm.DefaultSection.Println("Summary")
@@ -111,22 +124,30 @@ func Run() {
 	pterm.Info.Printfln("Log file:      gmail_labels_fetch_%s.log", workspacePrefix)
 	pterm.Info.Printfln("Result file:   %s", labelsFile)
 
+	log.Printf("[INFO] [RUN] summary: total=%d collected=%d pending=%d workers=%d", len(emails), collectedCount, len(pending), n)
+
 	if len(pending) == 0 {
 		pterm.Success.Println("All users collected. Nothing to do.")
+		log.Printf("[INFO] [RUN] все юзеры уже собраны, ничего не делать")
 		return
 	}
 
+	log.Printf("[INFO] [RUN] ожидание подтверждения...")
 	result, err := pterm.DefaultInteractiveConfirm.Show("Continue?")
 	if err != nil {
 		pterm.Warning.Printfln("Input error: %v — aborting.", err)
+		log.Printf("[WARN] [RUN] ошибка ввода: %v, прерываю", err)
 		return
 	}
 	if !result {
 		pterm.Warning.Println("Cancelled by user.")
+		log.Printf("[INFO] [RUN] отмена пользователем")
 		return
 	}
+	log.Printf("[INFO] [RUN] подтверждено, запускаю...")
 	fmt.Println()
 
+	log.Printf("[INFO] [RUN] запускаю periodic dumper (interval=%s)", labelsDumpInterval)
 	var dumperWg sync.WaitGroup
 	dumperWg.Add(1)
 	go func() {
@@ -157,6 +178,7 @@ func Run() {
 		o.UsersPending = len(pending)
 	})
 
+	log.Printf("[INFO] [RUN] signal handler установлен (SIGINT/SIGTERM/SIGWINCH)")
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM, syscall.SIGWINCH)
 	go func() {
@@ -201,6 +223,7 @@ func Run() {
 
 	requeue := make(chan string, len(pending))
 
+	log.Printf("[INFO] [RUN] запускаю %d воркеров для %d юзеров", n, len(pending))
 	start := time.Now()
 	var wg sync.WaitGroup
 	for i := 0; i < n; i++ {
@@ -226,6 +249,8 @@ func Run() {
 	if err := st.Save(); err != nil {
 		log.Printf("[WARN] [DUMP] final dump failed: %v", err)
 	}
+
+	log.Printf("[INFO] [RUN] завершено за %s, requeued=%d", elapsed, len(requeued))
 
 	fmt.Println()
 	if len(requeued) > 0 {

@@ -14,8 +14,10 @@ package store
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"sync"
+	"time"
 )
 
 // User - запись одного почтового ящика в результирующем файле.
@@ -36,21 +38,28 @@ type Store struct {
 }
 
 func New(path string) *Store {
+	log.Printf("[DEBUG] [STORE] new store: path=%s", path)
 	return &Store{path: path, data: make(map[string]*User)}
 }
 
 // Load читает уже собранные лейблы с диска.
 func (s *Store) Load() (count int, err error) {
+	start := time.Now()
+	log.Printf("[DEBUG] [STORE] загрузка из %s...", s.path)
+
 	raw, err := os.ReadFile(s.path)
 	if err != nil {
 		if os.IsNotExist(err) {
+			log.Printf("[DEBUG] [STORE] файл %s не найден, начинаю с пустого state", s.path)
 			return 0, nil
 		}
+		log.Printf("[ERROR] [STORE] чтение %s: %v", s.path, err)
 		return 0, fmt.Errorf("чтение %s: %w", s.path, err)
 	}
 
 	var rawTop map[string]json.RawMessage
 	if err := json.Unmarshal(raw, &rawTop); err != nil {
+		log.Printf("[ERROR] [STORE] парсинг %s: %v", s.path, err)
 		return 0, fmt.Errorf("парсинг %s: %w", s.path, err)
 	}
 
@@ -61,6 +70,7 @@ func (s *Store) Load() (count int, err error) {
 			LabelNames map[string]string   `json:"label_names"`
 		}
 		if err := json.Unmarshal(rawUser, &u); err != nil {
+			log.Printf("[ERROR] [STORE] парсинг записи для %s: %v", email, err)
 			return 0, fmt.Errorf("парсинг записи для %s: %w", email, err)
 		}
 		if u.Messages == nil {
@@ -79,6 +89,7 @@ func (s *Store) Load() (count int, err error) {
 	s.data = data
 	s.mu.Unlock()
 
+	log.Printf("[INFO] [STORE] загружено %d записей из %s (за %s)", len(data), s.path, time.Since(start))
 	return len(data), nil
 }
 
@@ -108,6 +119,8 @@ func (s *Store) Save() error {
 	s.fileMu.Lock()
 	defer s.fileMu.Unlock()
 
+	start := time.Now()
+
 	s.mu.Lock()
 	snapshot := deepCopy(s.data)
 	s.mu.Unlock()
@@ -115,6 +128,7 @@ func (s *Store) Save() error {
 	tmpPath := s.path + ".tmp"
 	f, err := os.Create(tmpPath)
 	if err != nil {
+		log.Printf("[ERROR] [STORE] создание %s: %v", tmpPath, err)
 		return fmt.Errorf("создание %s: %w", tmpPath, err)
 	}
 
@@ -123,18 +137,23 @@ func (s *Store) Save() error {
 	enc.SetEscapeHTML(false)
 	if err := enc.Encode(snapshot); err != nil {
 		f.Close()
+		log.Printf("[ERROR] [STORE] сериализация: %v", err)
 		return fmt.Errorf("сериализация: %w", err)
 	}
 	if err := f.Sync(); err != nil {
 		f.Close()
+		log.Printf("[ERROR] [STORE] fsync: %v", err)
 		return fmt.Errorf("fsync: %w", err)
 	}
 	if err := f.Close(); err != nil {
+		log.Printf("[ERROR] [STORE] close: %v", err)
 		return fmt.Errorf("close: %w", err)
 	}
 	if err := os.Rename(tmpPath, s.path); err != nil {
+		log.Printf("[ERROR] [STORE] rename %s -> %s: %v", tmpPath, s.path, err)
 		return fmt.Errorf("rename %s -> %s: %w", tmpPath, s.path, err)
 	}
+	log.Printf("[DEBUG] [STORE] сохранён в %s (за %s)", s.path, time.Since(start))
 	return nil
 }
 
@@ -192,6 +211,7 @@ func (s *Store) FinalizeUser(email string, labelNames map[string]string) {
 	defer s.mu.Unlock()
 	u := s.getOrCreate(email)
 	u.LabelNames = labelNames
+	log.Printf("[INFO] [STORE] %s: финализирован (%d labelNames)", email, len(labelNames))
 }
 
 // ==========================================
@@ -208,10 +228,12 @@ func (s *Store) SetMsgIndex(email string, msgIDs []string) {
 	ids := make([]string, len(msgIDs))
 	copy(ids, msgIDs)
 	s.msgIndex[email] = ids
+	log.Printf("[DEBUG] [STORE] %s: msg_index установлен (%d ids)", email, len(msgIDs))
 }
 
 // SaveMsgIndex сохраняет индекс msg_id во временный файл.
 func (s *Store) SaveMsgIndex(path string) error {
+	start := time.Now()
 	s.mu.Lock()
 	idx := make(map[string][]string, len(s.msgIndex))
 	for k, v := range s.msgIndex {
@@ -231,14 +253,20 @@ func (s *Store) SaveMsgIndex(path string) error {
 	if err := enc.Encode(idx); err != nil {
 		return err
 	}
-	return f.Sync()
+	if err := f.Sync(); err != nil {
+		return err
+	}
+	log.Printf("[INFO] [STORE] msg_index сохранён в %s (за %s)", path, time.Since(start))
+	return nil
 }
 
 // LoadMsgIndex загружает индекс msg_id из временного файла.
 func (s *Store) LoadMsgIndex(path string) error {
+	start := time.Now()
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
+			log.Printf("[DEBUG] [STORE] msg_index файл %s не найден", path)
 			return nil
 		}
 		return err
@@ -250,6 +278,7 @@ func (s *Store) LoadMsgIndex(path string) error {
 	s.mu.Lock()
 	s.msgIndex = idx
 	s.mu.Unlock()
+	log.Printf("[INFO] [STORE] msg_index загружен из %s: %d юзеров (за %s)", path, len(idx), time.Since(start))
 	return nil
 }
 
