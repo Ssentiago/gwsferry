@@ -184,6 +184,31 @@ func (w *ImapWorker) Close() {
 	w.closeConn()
 }
 
+// PreFetchExistingIDs загружает X-Gwsferry-MsgID для списка папок.
+// Делает один FETCH на папку. Возвращает объединённый map[msgID]bool.
+func (w *ImapWorker) PreFetchExistingIDs(ctx context.Context, folders []string) (map[string]bool, error) {
+	// Лениво подключаемся если ещё нет
+	if w.conn == nil {
+		if err := w.connect(); err != nil {
+			return nil, err
+		}
+	}
+
+	combined := make(map[string]bool)
+	for _, folder := range folders {
+		existing, err := fetchExistingMsgIDs(ctx, w.conn, folder)
+		if err != nil {
+			log.Printf("[WARN] [IMAP-W] %s: PreFetchExistingIDs failed для %s: %v, пропускаю папку", w.email, folder, err)
+			continue
+		}
+		for id := range existing {
+			combined[id] = true
+		}
+	}
+	log.Printf("[INFO] [IMAP-W] %s: PreFetchExistingIDs: %d уникальных msgID в %d папках", w.email, len(combined), len(folders))
+	return combined, nil
+}
+
 func (w *ImapWorker) closeConn() {
 	w.mu.Lock()
 	defer w.mu.Unlock()

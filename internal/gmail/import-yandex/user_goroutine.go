@@ -111,6 +111,51 @@ func runUserGoroutine(
 
 		dashUpdate(dash, workerKey, fmt.Sprintf("0/%d", len(pending)), "working")
 
+		// Pre-fetch: собираем уникальные папки и проверяем что уже есть на сервере
+		folderSet := make(map[string]struct{})
+		for _, l := range pending {
+			folderSet[ResolveFolder(l.LabelIDs, l.LabelNames)] = struct{}{}
+		}
+		uniqueFolders := make([]string, 0, len(folderSet))
+		for f := range folderSet {
+			uniqueFolders = append(uniqueFolders, f)
+		}
+		log.Printf("[INFO] [USER] %s: pre-fetch существующих msgID для %d папок: %v", user.Email, len(uniqueFolders), uniqueFolders)
+
+		preFetchWorker := NewImapWorker(user, params.API, params.ClientID, params.ClientSecret, &SharedToken{}, nil)
+		existingIDs, err := preFetchWorker.PreFetchExistingIDs(ctx, uniqueFolders)
+		preFetchWorker.Close()
+		if err != nil {
+			log.Printf("[WARN] [USER] %s: pre-fetch failed: %v, продолжаем без дедупа по серверу", user.Email, err)
+			existingIDs = nil
+		}
+
+		// Фильтруем письма которые уже есть на сервере
+		var filtered []Letter
+		skippedByServer := 0
+		for _, l := range pending {
+			if existingIDs != nil && existingIDs[l.MsgID] {
+				skippedByServer++
+				continue
+			}
+			filtered = append(filtered, l)
+		}
+		if skippedByServer > 0 {
+			log.Printf("[INFO] [USER] %s: пропущено %d писем (уже на сервере), к обработке %d",
+				user.Email, skippedByServer, len(filtered))
+			report.Skipped += skippedByServer
+		}
+		pending = filtered
+
+		if len(pending) == 0 {
+			log.Printf("[INFO] [USER] %s: все письма уже на сервере, помечаю done", user.Email)
+			st.markUserDone(user.Email)
+			dashUpdate(dash, workerKey, "уже на сервере", "done")
+			report.Duration = time.Since(start)
+			reportChan <- report
+			continue
+		}
+
 		// Канал с письмами — pipeline: скачивание + заливка идут параллельно
 		// Буфер = len(pending), иначе deadlock: goroutines ещё не стартовали,
 		// а запись в полный канал блокируется
