@@ -13,6 +13,7 @@ import (
 	"gwsferry/internal/gmail/fetch-labels/store"
 	"gwsferry/internal/gmail/gmailapi"
 	"gwsferry/internal/shared/dashboard"
+	"gwsferry/internal/shared/etatracker"
 	"gwsferry/internal/shared/util"
 )
 
@@ -149,8 +150,8 @@ func (a *app) worker(ctx context.Context, idx int, saKeyPath string, emailCh cha
 		retryRound := 0
 		concurrentRetryRound := 0
 		adaptive := newAdaptiveBatchSize()
-		eta := &etaTracker{}
-		eta.record(collected)
+		eta := etatracker.New(0.3)
+		eta.Record(collected)
 
 		fatalQuota := false
 		var errorLog []string
@@ -208,9 +209,9 @@ func (a *app) worker(ctx context.Context, idx int, saKeyPath string, emailCh cha
 					adaptive.reportCleanBatch()
 				}
 
-				eta.record(collected)
+				eta.Record(res.Written)
 				remaining := total - collected
-				etaStr := formatETA(eta.estimateSeconds(remaining))
+				etaStr := etatracker.FormatETA(eta.EstimateSeconds(remaining))
 				a.dash.UpdateWorker(workerKey, shortEmail, fmt.Sprintf("%d/%d", collected, total), etaStr)
 
 				if !a.shutdown.IsSet() {

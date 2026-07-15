@@ -1,20 +1,12 @@
 package fetchlabels
 
-import (
-	"fmt"
-	"time"
-)
+import "time"
 
 const (
-	workspacePrefix = "ru"
-	usersJSONPath   = "users.json"
-	saKeysDir       = "workers"
-
 	labelsDumpInterval = 60 * time.Second
 
-	maxRetries           = 5
-	workerStartStagger   = 3 * time.Second
-	maxConcurrentWorkers = 15
+	maxRetries         = 5
+	workerStartStagger = 3 * time.Second
 
 	batchSizeMax      = 80
 	batchSizeMin      = 10
@@ -28,9 +20,4 @@ const (
 	rateLimitBackoffBase          = 60 * time.Second
 	concurrentLimitBackoffBase    = 3 * time.Second
 	concurrentLimitBackoffMaxRnds = 6
-
-	stuckThreadsShutdownThreshold = 8
-	etaWindowSize                 = 10
 )
-
-var labelsFile = fmt.Sprintf("migration_labels_%s.json", workspacePrefix)
