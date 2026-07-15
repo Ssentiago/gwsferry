@@ -9,7 +9,7 @@ import (
 
 	"github.com/pterm/pterm"
 	"github.com/spf13/cobra"
-	"gwsferry/internal/gmail/import-yandex"
+	"gwsferry/internal/gmail/import-yandex-v2"
 	"gwsferry/internal/shared/config"
 )
 
@@ -47,7 +47,7 @@ var importCmd = &cobra.Command{
 			// TODO: interactive confirm
 		}
 
-		return importyandex.RunImport(cfg)
+		return importyandex.RunImport(cfg, "", "")
 	},
 }
 
@@ -142,10 +142,9 @@ func runTestMode(cfg *config.Config) error {
 	}
 
 	// Запускаем реальный импорт для выбранного Source
-	log.Printf("[INFO] [TEST] запуск импорта: source=%s", sourceEmail)
-	pterm.Info.Printfln("Запуск импорта для %s...", sourceEmail)
-	modeInfo := fmt.Sprintf("TEST MODE  |  %s → %s", sourceEmail, target)
-	if err := importyandex.RunImportWithMode(cfg, modeInfo, sourceEmail, target); err != nil {
+	log.Printf("[INFO] [TEST] запуск импорта: source=%s target=%s", sourceEmail, target)
+	pterm.Info.Printfln("Запуск импорта: %s → %s", sourceEmail, target)
+	if err := importyandex.RunImport(cfg, sourceEmail, target); err != nil {
 		return fmt.Errorf("импорт: %w", err)
 	}
 
