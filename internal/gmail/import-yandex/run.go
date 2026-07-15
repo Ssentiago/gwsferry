@@ -17,7 +17,9 @@ import (
 )
 
 // RunImport — точка входа: загрузка, summary, confirm, dashboard, запуск.
-func RunImport(cfg *config.Config) error {
+// Если emails переданы — импортирует только их (test mode).
+// Если emails пустой — читает из yandex_users.json.
+func RunImport(cfg *config.Config, emails ...string) error {
 	dir := execDir()
 	log.Printf("[INFO] [RUN] exec dir: %s", dir)
 
@@ -36,15 +38,6 @@ func RunImport(cfg *config.Config) error {
 	pterm.DefaultSection.Println("Yandex → IMAP импорт")
 
 	// 1. Юзеры
-	usersFile := filepath.Join(dir, "yandex_users.json")
-	log.Printf("[INFO] [RUN] проверяю файл юзеров: %s", usersFile)
-	if _, err := os.Stat(usersFile); os.IsNotExist(err) {
-		pterm.Error.Printfln("Файл %s не найден.", usersFile)
-		log.Printf("[ERROR] [RUN] файл юзеров не найден: %s", usersFile)
-		return fmt.Errorf("файл %s не найден", usersFile)
-	}
-	log.Printf("[INFO] [RUN] файл юзеров найден, размер OK")
-
 	log.Printf("[INFO] [RUN] создаю Yandex API клиент (orgID=%s, token len=%d)", cfg.Yandex.OrgID, len(cfg.Yandex.OAuthToken))
 	api := yandexapi.NewAPI(
 		yandexapi.NewClient(cfg.Yandex.OAuthToken),
@@ -52,12 +45,31 @@ func RunImport(cfg *config.Config) error {
 		cfg.Yandex.OAuthToken,
 	)
 
-	log.Printf("[INFO] [RUN] загружаю юзеров из %s + Yandex API...", usersFile)
-	userList, err := users.LoadUsers(api, usersFile)
-	if err != nil {
-		pterm.Error.Printfln("Ошибка загрузки юзеров: %v", err)
-		log.Printf("[ERROR] [RUN] ошибка загрузки юзеров: %v", err)
-		return err
+	var userList []yandexapi.User
+	if len(emails) > 0 {
+		// Test mode: импортируем только переданные email'ы
+		log.Printf("[INFO] [RUN] test mode: импорт %d юзеров из параметров", len(emails))
+		for _, e := range emails {
+			userList = append(userList, yandexapi.User{Email: e})
+		}
+	} else {
+		// Обычный режим: читаем из файла
+		usersFile := filepath.Join(dir, "yandex_users.json")
+		log.Printf("[INFO] [RUN] проверяю файл юзеров: %s", usersFile)
+		if _, err := os.Stat(usersFile); os.IsNotExist(err) {
+			pterm.Error.Printfln("Файл %s не найден.", usersFile)
+			log.Printf("[ERROR] [RUN] файл юзеров не найден: %s", usersFile)
+			return fmt.Errorf("файл %s не найден", usersFile)
+		}
+		log.Printf("[INFO] [RUN] файл юзеров найден, размер OK")
+
+		log.Printf("[INFO] [RUN] загружаю юзеров из %s + Yandex API...", usersFile)
+		userList, err = users.LoadUsers(api, usersFile)
+		if err != nil {
+			pterm.Error.Printfln("Ошибка загрузки юзеров: %v", err)
+			log.Printf("[ERROR] [RUN] ошибка загрузки юзеров: %v", err)
+			return err
+		}
 	}
 	log.Printf("[INFO] [RUN] загружено %d юзеров", len(userList))
 	for i, u := range userList {
