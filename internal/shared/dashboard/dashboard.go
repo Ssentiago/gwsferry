@@ -6,6 +6,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/pterm/pterm"
 	"gwsferry/internal/shared/timer"
@@ -52,12 +53,15 @@ type Dashboard struct {
 	workerLogs   []logLine
 	timer        *timer.Timer
 	modeInfo     string
+	lastRedraw   time.Time
+	redrawDelay  time.Duration
 }
 
 func New() *Dashboard {
 	return &Dashboard{
-		workers: make(map[string]WorkerState),
-		timer:   timer.New(),
+		workers:     make(map[string]WorkerState),
+		timer:       timer.New(),
+		redrawDelay: 200 * time.Millisecond,
 	}
 }
 
@@ -167,6 +171,13 @@ func (d *Dashboard) Log(level, msg string) {
 }
 
 func (d *Dashboard) redraw() {
+	// Throttle: не перерисовываем чаще чем redrawDelay
+	now := time.Now()
+	if now.Sub(d.lastRedraw) < d.redrawDelay {
+		return
+	}
+	d.lastRedraw = now
+
 	d.mu.Lock()
 	o := d.overall
 	workers := make(map[string]WorkerState, len(d.workers))
