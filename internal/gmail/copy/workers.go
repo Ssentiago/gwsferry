@@ -109,13 +109,13 @@ func (a *app) worker(ctx context.Context, idx int, saKeyPath string, emailCh cha
 		log.Printf("[DEBUG] [%s] %s: Gmail отдал %d message IDs", workerKey, shortEmail, total)
 		if total == 0 {
 			log.Printf("[DEBUG] [%s] %s: 0 писем, помечаю done", workerKey, shortEmail)
-			setUserStatus(a.st, email, "done", "")
+			setUserStatus(a.st, email, "done", "", a.cfg.StateFile)
 			a.bumpDone()
 			continue
 		}
 
 		// Проверяем S3
-		s3Prefix := filepath.Join(workspacePrefix, "users", email, "gmail") + "/"
+		s3Prefix := filepath.Join(a.cfg.Workspace, "users", email, "gmail") + "/"
 		log.Printf("[DEBUG] [%s] %s: листинг S3 prefix=%s", workerKey, shortEmail, s3Prefix)
 		a.dash.UpdateWorker(workerKey, shortEmail, fmt.Sprintf("S3 листинг... Gmail=%d", total), "")
 		existingInS3, err := getExistingMsgIDs(ctx, a.s3client, a.cfg.S3.Bucket, s3Prefix)
@@ -131,7 +131,7 @@ func (a *app) worker(ctx context.Context, idx int, saKeyPath string, emailCh cha
 			a.dash.UpdateWorker(workerKey, shortEmail, fmt.Sprintf("done (%d/%d)", total, total), "0")
 			a.dash.Log("INFO", fmt.Sprintf("[%s] %s: все %d писем в S3 — done", workerKey, shortEmail, total))
 			log.Printf("[DEBUG] [%s] %s: все %d в S3, done", workerKey, shortEmail, total)
-			setUserStatus(a.st, email, "done", "")
+			setUserStatus(a.st, email, "done", "", a.cfg.StateFile)
 			a.bumpDone()
 			continue
 		}
@@ -256,7 +256,7 @@ func (a *app) worker(ctx context.Context, idx int, saKeyPath string, emailCh cha
 
 		if a.shutdown.IsSet() {
 			a.dash.Log("WARN", fmt.Sprintf("[%s] Graceful shutdown: %s остановлен на %d/%d", workerKey, shortEmail, downloaded, len(missing)))
-			setUserStatus(a.st, email, "pending", "")
+			setUserStatus(a.st, email, "pending", "", a.cfg.StateFile)
 			return
 		}
 
@@ -276,6 +276,6 @@ func (a *app) worker(ctx context.Context, idx int, saKeyPath string, emailCh cha
 			log.Printf("[INFO] [USER] %s: завершён OK, %d/%d скачано", workerKey, downloaded, len(missing))
 			a.bumpDone()
 		}
-		setUserStatus(a.st, email, status, strings.Join(errorLog, "; "))
+		setUserStatus(a.st, email, status, strings.Join(errorLog, "; "), a.cfg.StateFile)
 	}
 }

@@ -19,22 +19,14 @@ import (
 	"gwsferry/internal/shared/util"
 )
 
-func Run() {
-	logf, err := os.OpenFile("migration_gmail_multi_sa_ru.log", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+func Run(cfg *config.Config) {
+	ws := cfg.Workspace
+	logf, err := os.OpenFile(fmt.Sprintf("migration_gmail_multi_sa_%s.log", ws), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
 	if err == nil {
 		log.SetOutput(&util.SyncFile{F: logf})
 		defer logf.Close()
-		log.Printf("[INFO] [RUN] лог-файл открыт: migration_gmail_multi_sa_ru.log")
+		log.Printf("[INFO] [RUN] лог-файл открыт: migration_gmail_multi_sa_%s.log", ws)
 	}
-
-	log.Printf("[INFO] [RUN] загружаю конфиг...")
-	cfg, err := config.Load()
-	if err != nil {
-		pterm.Error.Printfln("Ошибка загрузки конфига: %v", err)
-		log.Printf("[ERROR] [RUN] ошибка загрузки конфига: %v", err)
-		return
-	}
-	log.Printf("[INFO] [RUN] конфиг загружен OK")
 
 	fmt.Println()
 	pterm.DefaultSection.Println("Подготовка Gmail миграции")
@@ -45,6 +37,10 @@ func Run() {
 		log.Printf("[DEBUG] [RUN] RSS=%.0fMB (лимит %dMB)", rss, memoryLimitMB)
 	}
 
+	usersJSONPath := "users.json"
+	if execPath, err := os.Executable(); err == nil {
+		usersJSONPath = filepath.Join(filepath.Dir(execPath), "users.json")
+	}
 	log.Printf("[INFO] [RUN] проверяю файл юзеров: %s", usersJSONPath)
 	if _, err := os.Stat(usersJSONPath); err != nil {
 		pterm.Error.Printfln("Файл %s не найден.", usersJSONPath)
@@ -74,8 +70,15 @@ func Run() {
 		usageGB[u.Email] = gb
 	}
 
+	saKeysDir := cfg.SaKeysDir
+	if saKeysDir == "" {
+		saKeysDir = "workers"
+	}
+	if execPath, err := os.Executable(); err == nil {
+		saKeysDir = filepath.Join(filepath.Dir(execPath), saKeysDir)
+	}
 	log.Printf("[INFO] [RUN] загружаю SA ключи...")
-	allKeys, err := loadServiceAccountKeys()
+	allKeys, err := loadServiceAccountKeys(saKeysDir)
 	if err != nil {
 		pterm.Error.Println(err)
 		log.Printf("[ERROR] [RUN] загрузка SA ключей: %v", err)
@@ -93,19 +96,29 @@ func Run() {
 		log.Printf("[ERROR] [RUN] нет рабочих SA")
 		return
 	}
-	if n > maxConcurrentWorkers {
-		validKeys = validKeys[:maxConcurrentWorkers]
-		n = maxConcurrentWorkers
+	workers := cfg.Workers
+	if n > workers {
+		log.Printf("[WARN] [RUN] воркеров (%d) больше чем SA ключей (%d), ограничиваю до %d", n, workers, workers)
+		pterm.Warning.Printfln("Воркеров (%d) больше чем SA ключей (%d). Использую %d.", n, workers, workers)
+		validKeys = validKeys[:workers]
+		n = workers
 	}
 
 	log.Printf("[INFO] [RUN] загружаю состояние...")
-	st := loadState()
+	statePath := cfg.StateFile
+	if statePath == "" {
+		statePath = fmt.Sprintf("migration_gmail_state_%s.json", cfg.Workspace)
+	}
+	if execPath, err := os.Executable(); err == nil {
+		statePath = filepath.Join(filepath.Dir(execPath), statePath)
+	}
+	st := loadState(statePath)
 	for _, e := range emails {
 		if _, ok := st.Users[e]; !ok {
 			st.Users[e] = "pending"
 		}
 	}
-	saveState(st)
+	saveState(st, statePath)
 
 	// Считаем сколько уже завершено
 	doneCount := 0
@@ -130,7 +143,7 @@ func Run() {
 			for _, e := range emails {
 				st.Users[e] = "pending"
 			}
-			saveState(st)
+			saveState(st, statePath)
 		}
 	}
 
@@ -148,8 +161,8 @@ func Run() {
 	pterm.Info.Printfln("Already copied:       %d", skipped)
 	pterm.Info.Printfln("Pending:              %d", len(pending))
 	pterm.Info.Printfln("Workers (SA):         %d of %d", n, len(allKeys))
-	pterm.Info.Printfln("Log file:             migration_gmail_multi_sa_%s.log", workspacePrefix)
-	pterm.Info.Printfln("State file:           %s", stateFile)
+	pterm.Info.Printfln("Log file:             migration_gmail_multi_sa_%s.log", ws)
+	pterm.Info.Printfln("State file:           %s", cfg.StateFile)
 	if forceRescan {
 		pterm.Warning.Println("Force rescan — all users will be reprocessed")
 	}
@@ -182,7 +195,7 @@ func Run() {
 		for {
 			select {
 			case <-ticker.C:
-				saveState(st)
+				saveState(st, statePath)
 			case <-shutdown.Done():
 				return
 			}
@@ -215,7 +228,7 @@ func Run() {
 				log.Println("[WARN] [SHUTDOWN] Получен сигнал остановки.")
 				go func() {
 					time.Sleep(5 * time.Second)
-					saveState(st)
+					saveState(st, statePath)
 					os.Exit(0)
 				}()
 			}
@@ -255,7 +268,7 @@ func Run() {
 
 	shutdown.Set()
 	dumperWg.Wait()
-	saveState(st)
+	saveState(st, statePath)
 
 	elapsed := time.Since(start)
 	log.Printf("[INFO] [RUN] завершено за %s, requeued=%d", elapsed, len(requeued))
@@ -265,26 +278,26 @@ func Run() {
 	} else {
 		pterm.Success.Printfln("=== GMAIL COPY COMPLETED in %s ===", elapsed)
 	}
-	pterm.Info.Printfln("State saved to:      %s", stateFile)
-	pterm.Info.Printfln("Log file:            migration_gmail_multi_sa_%s.log", workspacePrefix)
+	pterm.Info.Printfln("State saved to:      %s", cfg.StateFile)
+	pterm.Info.Printfln("Log file:            migration_gmail_multi_sa_%s.log", ws)
 
 	fmt.Print("\033[0m")
 	os.Stdout.Sync()
 }
 
-func loadServiceAccountKeys() ([]string, error) {
-	entries, err := os.ReadDir(saKeysDir)
+func loadServiceAccountKeys(dir string) ([]string, error) {
+	entries, err := os.ReadDir(dir)
 	if err != nil {
-		return nil, fmt.Errorf("папка %s не найдена", saKeysDir)
+		return nil, fmt.Errorf("папка %s не найдена", dir)
 	}
 	var keys []string
 	for _, e := range entries {
 		if !e.IsDir() && strings.HasSuffix(e.Name(), ".json") {
-			keys = append(keys, filepath.Join(saKeysDir, e.Name()))
+			keys = append(keys, filepath.Join(dir, e.Name()))
 		}
 	}
 	if len(keys) == 0 {
-		return nil, fmt.Errorf("в %s нет .json ключей", saKeysDir)
+		return nil, fmt.Errorf("в %s нет .json ключей", dir)
 	}
 	util.SortStringsNatural(keys)
 	return keys, nil

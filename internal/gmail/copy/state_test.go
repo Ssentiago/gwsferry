@@ -7,20 +7,18 @@ import (
 
 func TestLoadSaveState(t *testing.T) {
 	dir := t.TempDir()
-	origStateFile := stateFile
-	stateFile = filepath.Join(dir, "state.json")
-	defer func() { stateFile = origStateFile }()
+	path := filepath.Join(dir, "state.json")
 
-	st := loadState()
+	st := loadState(path)
 	if st.Users == nil {
 		t.Fatal("users map is nil")
 	}
 
 	st.Users["user@test.com"] = "done"
 	st.Users["other@test.com"] = "pending"
-	saveState(st)
+	saveState(st, path)
 
-	st2 := loadState()
+	st2 := loadState(path)
 	if st2.Users["user@test.com"] != "done" {
 		t.Errorf("expected done, got %s", st2.Users["user@test.com"])
 	}
