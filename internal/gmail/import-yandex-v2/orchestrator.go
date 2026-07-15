@@ -45,12 +45,6 @@ func dashUpdate(dash *dashboard.Dashboard, key, task, status string) {
 	}
 }
 
-func dash_eta(dash *dashboard.Dashboard, key, eta string) {
-	if dash != nil {
-		dash.UpdateWorker(key, "", "", eta)
-	}
-}
-
 // RunUserImport — импорт писем из SOURCE в TARGET для одного пользователя.
 func RunUserImport(
 	ctx context.Context,
@@ -107,7 +101,8 @@ func RunUserImport(
 		}
 		pending = append(pending, l)
 	}
-	log.Printf("[INFO] [USER] к обработке %d/%d (resume skip %d)", len(pending), len(letters), report.Skipped-len(warnings))
+	stateSkipped := report.Skipped - len(warnings)
+	log.Printf("[INFO] [USER] к обработке %d/%d (resume skip %d)", len(pending), len(letters), stateSkipped)
 
 	if len(pending) == 0 {
 		st.markUserDone(params.SourceUser.Email)
@@ -115,7 +110,8 @@ func RunUserImport(
 		return
 	}
 
-	dashUpdate(dash, workerKey, fmt.Sprintf("0/%d", len(pending)), "working")
+	// Показываем начальное состояние: пропущено + осталось
+	dashUpdate(dash, workerKey, fmt.Sprintf("пропущено %d, к обработке %d", stateSkipped, len(pending)), "working")
 
 	// 3. Dedup — проверяем TARGET IMAP
 	folderSet := make(map[string]struct{})
@@ -197,10 +193,10 @@ func RunUserImport(
 		eta.Record(1)
 		remaining := len(pending) - report.Processed - report.Failed
 		etaStr := etatracker.FormatETA(eta.EstimateSeconds(remaining))
-		dashUpdate(dash, workerKey,
+		// Обновляем task+status+eta одним вызовом чтобы не затереть
+		dash.UpdateWorker(workerKey,
 			fmt.Sprintf("%d/%d", report.Processed+report.Failed, len(pending)),
-			"working")
-		dash_eta(dash, workerKey, etaStr)
+			"working", etaStr)
 	}
 
 	if report.Failed > 0 {
