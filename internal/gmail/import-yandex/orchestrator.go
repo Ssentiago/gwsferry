@@ -2,12 +2,13 @@ package importyandex
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"sync"
 	"syscall"
-	"fmt"
 
 	yandexapi "gwsferry/internal/gmail/import-yandex/api"
 	"gwsferry/internal/shared/config"
@@ -31,7 +32,13 @@ const MsgWorkers = 25
 func Run(ctx context.Context, params OrchestratorParams, cfg *config.Config, dash *dashboard.Dashboard) {
 	userWorkers := cfg.Yandex.UserWorkers
 	msgWorkers := MsgWorkers
-	statePath := stateFilePath()
+	statePath := cfg.StateFile
+	if statePath == "" {
+		statePath = "import_state.json"
+	}
+	if execPath, err := os.Executable(); err == nil {
+		statePath = filepath.Join(filepath.Dir(execPath), statePath)
+	}
 
 	log.Printf("[INFO] [ORCH] запуск оркестратора: userWorkers=%d msgWorkers=%d statePath=%s",
 		userWorkers, msgWorkers, statePath)

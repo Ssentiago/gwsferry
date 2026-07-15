@@ -111,7 +111,7 @@ func runUserGoroutine(
 
 		dashUpdate(dash, workerKey, fmt.Sprintf("0/%d", len(pending)), "working")
 
-		// Pre-fetch: собираем уникальные папки и проверяем что уже есть на сервере
+		// Pre-fetch: собираем уникальные папки и проверяем что уже есть на TARGET (Yandex IMAP)
 		folderSet := make(map[string]struct{})
 		for _, l := range pending {
 			folderSet[ResolveFolder(l.LabelIDs, l.LabelNames)] = struct{}{}
@@ -120,13 +120,14 @@ func runUserGoroutine(
 		for f := range folderSet {
 			uniqueFolders = append(uniqueFolders, f)
 		}
-		log.Printf("[INFO] [USER] %s: pre-fetch существующих msgID для %d папок: %v", user.Email, len(uniqueFolders), uniqueFolders)
+		log.Printf("[INFO] [USER] %s: pre-fetch существующих msgID в TARGET для %d папок: %v", user.Email, len(uniqueFolders), uniqueFolders)
 
+		// Подключаемся к TARGET (Yandex IMAP) для проверки дедупа
 		preFetchWorker := NewImapWorker(user, params.API, params.ClientID, params.ClientSecret, &SharedToken{}, nil)
 		existingIDs, err := preFetchWorker.PreFetchExistingIDs(ctx, uniqueFolders)
 		preFetchWorker.Close()
 		if err != nil {
-			log.Printf("[WARN] [USER] %s: pre-fetch failed: %v, продолжаем без дедупа по серверу", user.Email, err)
+			log.Printf("[WARN] [USER] %s: pre-fetch target failed: %v, продолжаем без дедупа по серверу", user.Email, err)
 			existingIDs = nil
 		}
 
@@ -166,8 +167,8 @@ func runUserGoroutine(
 		close(taskChan)
 		log.Printf("[INFO] [USER] %s: taskChan создан и заполнен: %d задач", user.Email, len(pending))
 
-		// Пул MessagesGoroutine — каждая горутина со своим ImapWorker и соединением
-		// Общий токен и папки на уровне user — шарятся между всеми msg-воркерами
+		// Пул MessagesGoroutine — каждая горутина со своим ImapWorker
+		// Все воркеры подключаются к TARGET (Yandex IMAP)
 		sharedToken := &SharedToken{}
 		createdFolders := &sync.Map{}
 		msgReportChan := make(chan MessageReport, len(pending))
@@ -177,7 +178,7 @@ func runUserGoroutine(
 			go func(workerID int) {
 				defer msgWg.Done()
 				worker := NewImapWorker(user, params.API, params.ClientID, params.ClientSecret, sharedToken, createdFolders)
-				log.Printf("[DEBUG] [USER] %s: msg-воркер %d запущен (ImapWorker)", user.Email, workerID)
+				log.Printf("[DEBUG] [USER] %s: msg-воркер %d запущен (ImapWorker → TARGET Yandex)", user.Email, workerID)
 				runMessagesGoroutine(ctx, params.S3, worker, taskChan, msgReportChan)
 				worker.Close()
 				log.Printf("[DEBUG] [USER] %s: msg-воркер %d завершён", user.Email, workerID)

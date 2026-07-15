@@ -2,10 +2,8 @@ package importyandex
 
 import (
 	"encoding/json"
-	"fmt"
 	"log"
 	"os"
-	"path/filepath"
 	"sync"
 	"time"
 )
@@ -159,16 +157,4 @@ func startPeriodicDumper(s *ImportState, path string) (stop func()) {
 		}
 	}()
 	return func() { close(done) }
-}
-
-// stateFilePath возвращает путь к файлу состояния рядом с бинарём.
-func stateFilePath() string {
-	execPath, err := os.Executable()
-	if err != nil {
-		log.Printf("[DEBUG] [STATE] не удалось определить путь к бинарю: %v, fallback import_state.json", err)
-		return "import_state.json"
-	}
-	path := fmt.Sprintf("%s/import_state.json", filepath.Dir(execPath))
-	log.Printf("[DEBUG] [STATE] stateFilePath=%s", path)
-	return path
 }

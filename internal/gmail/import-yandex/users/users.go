@@ -72,27 +72,53 @@ func loadEmails(filePath string) ([]string, error) {
 	}
 	log.Printf("[DEBUG] [USERS] файл прочитан: %d bytes", len(raw))
 
-	var file struct {
+	// Пробуем формат 1: {"users": ["email1", "email2"]}
+	var asArray struct {
 		Users []string `json:"users"`
 	}
-	if err := json.Unmarshal(raw, &file); err != nil {
-		log.Printf("[ERROR] [USERS] парсинг JSON %s: %v", filePath, err)
-		return nil, fmt.Errorf("parse %s: %w", filePath, err)
+	if err := json.Unmarshal(raw, &asArray); err == nil && len(asArray.Users) > 0 {
+		return dedup(asArray.Users), nil
 	}
-	log.Printf("[DEBUG] [USERS] JSON распарсен: %d emails в массиве", len(file.Users))
 
-	seen := make(map[string]struct{}, len(file.Users))
-	var unique []string
-	for _, email := range file.Users {
-		if _, ok := seen[email]; !ok {
-			seen[email] = struct{}{}
-			unique = append(unique, email)
-		} else {
-			log.Printf("[DEBUG] [USERS] дубликат пропущен: %s", email)
+	// Пробуем формат 2: {"users": {"email1": {...}, "email2": {...}}}
+	var asObject struct {
+		Users map[string]json.RawMessage `json:"users"`
+	}
+	if err := json.Unmarshal(raw, &asObject); err == nil && len(asObject.Users) > 0 {
+		var emails []string
+		for email := range asObject.Users {
+			emails = append(emails, email)
+		}
+		return dedup(emails), nil
+	}
+
+	// Пробуем формат 3: [{"email": "..."}, ...] (массив объектов)
+	var asSlice []struct {
+		Email string `json:"email"`
+	}
+	if err := json.Unmarshal(raw, &asSlice); err == nil && len(asSlice) > 0 {
+		var emails []string
+		for _, u := range asSlice {
+			if u.Email != "" {
+				emails = append(emails, u.Email)
+			}
+		}
+		return dedup(emails), nil
+	}
+
+	return nil, fmt.Errorf("не удалось распарсить %s: неизвестный формат", filePath)
+}
+
+func dedup(items []string) []string {
+	seen := make(map[string]struct{}, len(items))
+	var result []string
+	for _, item := range items {
+		if _, ok := seen[item]; !ok {
+			seen[item] = struct{}{}
+			result = append(result, item)
 		}
 	}
-	log.Printf("[DEBUG] [USERS] после дедупликации: %d уникальных emails", len(unique))
-	return unique, nil
+	return result
 }
 
 // UserFilePath возвращает путь к yandex_users.json рядом с бинарём.

@@ -44,12 +44,11 @@ type ImapWorker struct {
 
 	mu             sync.Mutex
 	conn           *imaplib.Client
-	sharedToken    *SharedToken // shared across workers for same user
-	createdFolders *sync.Map    // shared across workers for same user — prevents concurrent CREATE
+	sharedToken    *SharedToken
+	createdFolders *sync.Map
 }
 
-// NewImapWorker creates a worker. Connection is lazily established on first Append.
-// sharedToken and createdFolders are shared across all workers for the same user.
+// NewImapWorker создаёт воркер с OAuth2 auth (TARGET: Yandex IMAP).
 func NewImapWorker(user yandexapi.User, api *yandexapi.API, clientID, clientSecret string, sharedToken *SharedToken, createdFolders *sync.Map) *ImapWorker {
 	return &ImapWorker{
 		email:          user.Email,
@@ -223,11 +222,11 @@ func (w *ImapWorker) connect() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
-	// Double-check after acquiring lock
 	if w.conn != nil {
 		return nil
 	}
 
+	// OAuth2 auth (TARGET: Yandex IMAP)
 	token, err := w.ensureTokenLocked()
 	if err != nil {
 		return err

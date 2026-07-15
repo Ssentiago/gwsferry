@@ -23,8 +23,15 @@ import (
 // ImapTimeout — timeout for one IMAP operation (Append, List, Fetch, etc.).
 var ImapTimeout = 10 * time.Minute
 
-const imapHost = "imap.yandex.ru:993"
+var imapHost = "imap.yandex.ru:993"
 const imapDialTimeout = 30 * time.Second
+
+// SetImapHost переопределяет IMAP хост (для target-сервера).
+func SetImapHost(host string) {
+	if host != "" {
+		imapHost = host
+	}
+}
 
 // ==========================================
 // COUNTERS
@@ -137,7 +144,12 @@ func ConnectAndAuth(email, token string) (*client.Client, error) {
 	}
 	log.Printf("[DEBUG] [IMAP] ConnectAndAuth: TCP dial OK %s %s", email, time.Since(start))
 
-	tlsConn := tls.Client(conn, &tls.Config{ServerName: "imap.yandex.ru"})
+	// TLS ServerName = хост без порта
+	tlsServerName := imapHost
+	if idx := strings.LastIndex(imapHost, ":"); idx > 0 {
+		tlsServerName = imapHost[:idx]
+	}
+	tlsConn := tls.Client(conn, &tls.Config{ServerName: tlsServerName})
 	if err := tlsConn.Handshake(); err != nil {
 		conn.Close()
 		return nil, fmt.Errorf("imap tls handshake: %w", err)

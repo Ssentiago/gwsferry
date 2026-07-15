@@ -14,9 +14,8 @@ import (
 )
 
 var (
-	importWorkers int
-	importYes     bool
-	importTest    bool
+	importYes  bool
+	importTest bool
 )
 
 var importCmd = &cobra.Command{
@@ -27,9 +26,15 @@ var importCmd = &cobra.Command{
 
 Режимы:
   Обычный    gwsferry import — импорт из всех юзеров yandex_users.json
-  Тестовый   gwsferry import --test-mode — выбор Target/Source, импорт происходит`,
+  Тестовый   gwsferry import --test-mode — выбор Target/Source, импорт происходит
+
+Флаги переопределяют значения из конфиг-файла.`,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		cfg, err := config.Load()
+		cfg, err := config.LoadAndResolve(config.CLIOverrides{
+			LabelsFile: importLabelsFile,
+			StateFile:  importStateFile,
+			Workers:    importWorkers,
+		})
 		if err != nil {
 			return err
 		}
@@ -46,10 +51,18 @@ var importCmd = &cobra.Command{
 	},
 }
 
+var (
+	importLabelsFile string
+	importStateFile  string
+	importWorkers    int
+)
+
 func init() {
-	importCmd.Flags().IntVarP(&importWorkers, "workers", "w", 0, "количество msg-воркеров на юзера (по умолчанию из конфига)")
-	importCmd.Flags().BoolVarP(&importYes, "yes", "y", false, "пропустить подтверждение")
-	importCmd.Flags().BoolVar(&importTest, "test-mode", false, "тестовый режим: выбор Target/Source без реального импорта")
+	importCmd.Flags().StringVar(&importLabelsFile, "labels-file", "", "путь к migration_labels.json (по умолчанию: migration_labels.json)")
+	importCmd.Flags().StringVar(&importStateFile, "state-file", "", "путь к файлу состояния (по умолчанию: import_state.json)")
+	importCmd.Flags().IntVarP(&importWorkers, "workers", "w", 0, "количество user-воркеров (по умолчанию: 10)")
+	importCmd.Flags().BoolVarP(&importYes, "yes", "y", false, "пропустить подтверждение перед импортом")
+	importCmd.Flags().BoolVar(&importTest, "test-mode", false, "тестовый режим: интерактивный выбор Target/Source, затем реальный импорт")
 	rootCmd.AddCommand(importCmd)
 }
 
@@ -58,14 +71,11 @@ func runTestMode(cfg *config.Config) error {
 	fmt.Println()
 	pterm.DefaultSection.Println("Yandex Import — Test Mode")
 
-	execPath, err := os.Executable()
-	if err != nil {
-		return fmt.Errorf("определение пути к бинарю: %w", err)
+	// 1. Загружаем юзеров для Target
+	usersFile := "yandex_users.json"
+	if execPath, err := os.Executable(); err == nil {
+		usersFile = filepath.Join(filepath.Dir(execPath), "yandex_users.json")
 	}
-	dir := filepath.Dir(execPath)
-
-	// 1. Загружаем юзеров из yandex_users.json для Target
-	usersFile := filepath.Join(dir, "yandex_users.json")
 	users, err := loadUsersForSelect(usersFile)
 	if err != nil {
 		return fmt.Errorf("загрузка юзеров: %w", err)
@@ -134,7 +144,8 @@ func runTestMode(cfg *config.Config) error {
 	// Запускаем реальный импорт для выбранного Source
 	log.Printf("[INFO] [TEST] запуск импорта: source=%s", sourceEmail)
 	pterm.Info.Printfln("Запуск импорта для %s...", sourceEmail)
-	if err := importyandex.RunImport(cfg, sourceEmail); err != nil {
+	modeInfo := fmt.Sprintf("TEST MODE  |  %s → %s", sourceEmail, target)
+	if err := importyandex.RunImportWithMode(cfg, modeInfo, sourceEmail); err != nil {
 		return fmt.Errorf("импорт: %w", err)
 	}
 

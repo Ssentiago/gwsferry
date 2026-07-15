@@ -6,7 +6,6 @@ import (
 	"log"
 	"os"
 	"path/filepath"
-	"strings"
 
 	"github.com/pterm/pterm"
 	yandexapi "gwsferry/internal/gmail/import-yandex/api"
@@ -19,12 +18,14 @@ import (
 // RunImport — точка входа: загрузка, summary, confirm, dashboard, запуск.
 // Если emails переданы — импортирует только их (test mode).
 // Если emails пустой — читает из yandex_users.json.
+// modeInfo — строка для отображения в дашборде (например "TEST MODE | target → source").
 func RunImport(cfg *config.Config, emails ...string) error {
-	dir := execDir()
-	log.Printf("[INFO] [RUN] exec dir: %s", dir)
+	return RunImportWithMode(cfg, "", emails...)
+}
 
+func RunImportWithMode(cfg *config.Config, modeInfo string, emails ...string) error {
 	// Лог-файл
-	logPath := filepath.Join(dir, "yandex_import.log")
+	logPath := "yandex_import.log"
 	logf, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
 	if err != nil {
 		log.Printf("[WARN] [RUN] не удалось открыть лог-файл %s: %v, логи идут только в stdout", logPath, err)
@@ -37,6 +38,12 @@ func RunImport(cfg *config.Config, emails ...string) error {
 	fmt.Println()
 	pterm.DefaultSection.Println("Yandex → IMAP импорт")
 
+	// Устанавливаем IMAP хост из конфига (TARGET: Yandex)
+	if cfg.ImapHost != "" {
+		SetImapHost(cfg.ImapHost)
+	}
+	log.Printf("[INFO] [RUN] IMAP target host: %s", imapHost)
+
 	// 1. Юзеры
 	log.Printf("[INFO] [RUN] создаю Yandex API клиент (orgID=%s, token len=%d)", cfg.Yandex.OrgID, len(cfg.Yandex.OAuthToken))
 	api := yandexapi.NewAPI(
@@ -48,13 +55,30 @@ func RunImport(cfg *config.Config, emails ...string) error {
 	var userList []yandexapi.User
 	if len(emails) > 0 {
 		// Test mode: импортируем только переданные email'ы
+		// Находим полные объекты User (с ID) через Yandex API
 		log.Printf("[INFO] [RUN] test mode: импорт %d юзеров из параметров", len(emails))
+		allUsers, err := api.ListUsers()
+		if err != nil {
+			return fmt.Errorf("загрузка юзеров из Yandex API: %w", err)
+		}
+		emailSet := make(map[string]bool, len(emails))
 		for _, e := range emails {
-			userList = append(userList, yandexapi.User{Email: e})
+			emailSet[e] = true
+		}
+		for _, u := range allUsers {
+			if emailSet[u.Email] {
+				userList = append(userList, u)
+			}
+		}
+		if len(userList) == 0 {
+			return fmt.Errorf("ни один из переданных email не найден в Yandex API")
 		}
 	} else {
-		// Обычный режим: читаем из файла
-		usersFile := filepath.Join(dir, "yandex_users.json")
+		// Обычный режим: читаем из файла рядом с бинарём
+		usersFile := "yandex_users.json"
+		if execPath, err := os.Executable(); err == nil {
+			usersFile = filepath.Join(filepath.Dir(execPath), "yandex_users.json")
+		}
 		log.Printf("[INFO] [RUN] проверяю файл юзеров: %s", usersFile)
 		if _, err := os.Stat(usersFile); os.IsNotExist(err) {
 			pterm.Error.Printfln("Файл %s не найден.", usersFile)
@@ -77,7 +101,13 @@ func RunImport(cfg *config.Config, emails ...string) error {
 	}
 
 	// 2. Лейблы
-	labelsFile := filepath.Join(dir, "migration_labels.json")
+	labelsFile := cfg.LabelsFile
+	if labelsFile == "" {
+		labelsFile = fmt.Sprintf("migration_labels_%s.json", cfg.Workspace)
+	}
+	if execPath, err := os.Executable(); err == nil {
+		labelsFile = filepath.Join(filepath.Dir(execPath), labelsFile)
+	}
 	log.Printf("[INFO] [RUN] проверяю файл лейблов: %s", labelsFile)
 	if _, err := os.Stat(labelsFile); os.IsNotExist(err) {
 		pterm.Error.Printfln("Файл %s не найден.", labelsFile)
@@ -109,7 +139,13 @@ func RunImport(cfg *config.Config, emails ...string) error {
 	log.Printf("[INFO] [RUN] S3 клиент создан OK")
 
 	// 4. Resume — проверяем сколько уже обработано
-	statePath := stateFilePath()
+	statePath := cfg.StateFile
+	if statePath == "" {
+		statePath = "import_state.json"
+	}
+	if execPath, err := os.Executable(); err == nil {
+		statePath = filepath.Join(filepath.Dir(execPath), statePath)
+	}
 	log.Printf("[INFO] [RUN] загружаю состояние из %s...", statePath)
 	st := loadImportState(statePath)
 	doneCount := 0
@@ -131,6 +167,7 @@ func RunImport(cfg *config.Config, emails ...string) error {
 	pterm.Info.Printfln("Pending:              %d", len(userList)-doneCount)
 	pterm.Info.Printfln("User workers:         %d", cfg.Yandex.UserWorkers)
 	pterm.Info.Printfln("Msg workers/user:     %d", MsgWorkers)
+	pterm.Info.Printfln("IMAP target:          %s", imapHost)
 	pterm.Info.Printfln("Log file:             %s", logPath)
 	pterm.Info.Printfln("State file:           %s", statePath)
 	pterm.Info.Printfln("Labels file:          %s", labelsFile)
@@ -162,6 +199,9 @@ func RunImport(cfg *config.Config, emails ...string) error {
 	dash := dashboard.New()
 	dash.Start()
 	dash.StartTimer()
+	if modeInfo != "" {
+		dash.SetModeInfo(modeInfo)
+	}
 	defer dash.Stop()
 
 	dash.UpdateOverall(func(o *dashboard.OverallState) {
@@ -203,20 +243,4 @@ func RunImport(cfg *config.Config, emails ...string) error {
 	fmt.Print("\033[0m")
 	os.Stdout.Sync()
 	return nil
-}
-
-func execDir() string {
-	execPath, err := os.Executable()
-	if err != nil {
-		return "."
-	}
-	return filepath.Dir(execPath)
-}
-
-// padRight дополняет строку пробелами справа до нужной длины.
-func padRight(s string, n int) string {
-	if len(s) >= n {
-		return s[:n]
-	}
-	return s + strings.Repeat(" ", n-len(s))
 }
