@@ -183,8 +183,8 @@ func RunImport(cfg *config.Config, sourceEmail, targetEmail string) error {
 	// 9. Dashboard
 	dash := dashboard.New()
 	dash.Start()
-	dash.StartTimer()
 	defer dash.Stop()
+	dash.StartTimer()
 
 	if isTestMode {
 		dash.SetModeInfo(fmt.Sprintf("TEST MODE  |  %s → %s", sourceUser.Email, targetUser.Email))
@@ -206,6 +206,14 @@ func RunImport(cfg *config.Config, sourceEmail, targetEmail string) error {
 
 	// 10. Запуск
 	for _, t := range tasks {
+		// Проверяем не нажат ли Ctrl+C между пользователями
+		select {
+		case <-dash.QuitCh():
+			log.Println("[WARN] [RUN] Ctrl+C между пользователями, останавливаю")
+			goto done
+		default:
+		}
+
 		key := t.Source.Email
 		if isTestMode {
 			key = fmt.Sprintf("%s → %s", t.Source.Email, t.Target.Email)
@@ -224,7 +232,9 @@ func RunImport(cfg *config.Config, sourceEmail, targetEmail string) error {
 		log.Printf("[INFO] [RUN] запуск: source=%s target=%s", t.Source.Email, t.Target.Email)
 		RunUserImport(context.Background(), params, st, statePath, dash, key)
 	}
+done:
 
+	dash.Stop()
 	pterm.Success.Println("Импорт завершён.")
 	fmt.Print("\033[0m")
 	os.Stdout.Sync()

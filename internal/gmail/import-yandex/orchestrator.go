@@ -5,9 +5,7 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"os/signal"
 	"sync"
-	"syscall"
 	"time"
 
 	yandexapi "gwsferry/internal/gmail/import-yandex/api"
@@ -61,29 +59,20 @@ func RunUserImport(
 
 	// Shutdown coordination
 	shutdown := util.NewShutdownFlag()
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM, syscall.SIGWINCH)
+	ctx = shutdown.Context()
+
+	// Listen for Ctrl+C from Bubble Tea (edinstvennyy put' v raw mode)
 	go func() {
-		for sig := range sigCh {
-			switch sig {
-			case syscall.SIGWINCH:
-				if dash != nil {
-					dash.ForceRedraw()
-				}
-			case syscall.SIGINT, syscall.SIGTERM:
-				if shutdown.IsSet() {
-					continue
-				}
-				shutdown.Set()
-				log.Println("[WARN] [SHUTDOWN] Получен сигнал остановки - сохраняю состояние.")
-				go func() {
-					time.Sleep(5 * time.Second)
-					saveImportState(st, statePath)
-					log.Println("[WARN] [SHUTDOWN] Экстренный дамп выполнен.")
-					os.Exit(0)
-				}()
-			}
+		<-dash.QuitCh()
+		if !shutdown.IsSet() {
+			shutdown.Set()
 		}
+		log.Println("[WARN] [SHUTDOWN] Ctrl+C: принудительный выход через 5с.")
+		go func() {
+			time.Sleep(5 * time.Second)
+			saveImportState(st, statePath)
+			os.Exit(0)
+		}()
 	}()
 
 	log.Printf("[INFO] [USER] ======== ИМПОРТ %s → %s ========", params.SourceUser.Email, params.TargetUser.Email)
@@ -143,12 +132,12 @@ func RunUserImport(
 	log.Printf("[INFO] [USER] pre-fetch dedup в TARGET (%s) для %d папок", params.TargetUser.Email, len(uniqueFolders))
 
 	var existingIDs map[string]bool
-	preFetchWorker := NewImapWorker(params.TargetUser, params.API, params.ClientID, params.ClientSecret, &SharedToken{}, nil)
+	preFetchWorker := NewImapWorker(params.TargetUser, params.API, params.ClientID, params.ClientSecret, &SharedToken{}, nil, nil)
 	existingIDs, err = preFetchWorker.PreFetchExistingIDs(ctx, uniqueFolders)
 	preFetchWorker.Close()
 	if err != nil {
 		log.Printf("[WARN] [USER] pre-fetch failed (1/2): %v, retry...", err)
-		w2 := NewImapWorker(params.TargetUser, params.API, params.ClientID, params.ClientSecret, &SharedToken{}, nil)
+		w2 := NewImapWorker(params.TargetUser, params.API, params.ClientID, params.ClientSecret, &SharedToken{}, nil, nil)
 		existingIDs, err = w2.PreFetchExistingIDs(ctx, uniqueFolders)
 		w2.Close()
 		if err != nil {
@@ -195,31 +184,58 @@ func RunUserImport(
 	eta := etatracker.New(0.3)
 	eta.Record(0)
 
+	var msgWg sync.WaitGroup
+	msgWg.Add(MsgWorkers)
 	for i := 0; i < MsgWorkers; i++ {
 		go func() {
-			worker := NewImapWorker(params.TargetUser, params.API, params.ClientID, params.ClientSecret, sharedToken, createdFolders)
+			defer msgWg.Done()
+			worker := NewImapWorker(params.TargetUser, params.API, params.ClientID, params.ClientSecret, sharedToken, createdFolders,
+				func(status string) {
+					dashUpdate(dash, workerKey, status, "working")
+				})
 			runMessagesGoroutine(ctx, params.S3, worker, taskChan, msgReportChan)
 			worker.Close()
 		}()
 	}
 
-	for mr := range msgReportChan {
-		if mr.Err != nil {
-			report.Failed++
-		} else {
-			report.Processed++
-			st.markMessageDone(params.SourceUser.Email, mr.MsgID)
-		}
-		eta.Record(1)
-		done := stateSkipped + report.Processed + report.Failed
-		remaining := totalLetters - done
-		etaStr := etatracker.FormatETA(eta.EstimateSeconds(remaining))
-		dash.UpdateWorker(workerKey,
-			fmt.Sprintf("%d/%d", done, totalLetters),
-			"working", etaStr)
-	}
+	go func() {
+		msgWg.Wait()
+		close(msgReportChan)
+	}()
 
-	if report.Failed > 0 {
+	for {
+		select {
+		case <-ctx.Done():
+			goto done
+		case mr, ok := <-msgReportChan:
+			if !ok {
+				goto done
+			}
+			if mr.Err != nil {
+				report.Failed++
+			} else {
+				report.Processed++
+				st.markMessageDone(params.SourceUser.Email, mr.MsgID)
+			}
+			eta.Record(1)
+			done := stateSkipped + report.Processed + report.Failed
+			remaining := totalLetters - done
+			etaStr := etatracker.FormatETA(eta.EstimateSeconds(remaining))
+			dash.UpdateWorker(workerKey,
+				fmt.Sprintf("%d/%d", done, totalLetters),
+				"working", etaStr)
+		}
+	}
+done:
+
+	if ctx.Err() != nil {
+		// Shutdown: помечаем юзера как pending для следующего запуска
+		st.markMessageDone(params.SourceUser.Email, "") // no-op marker
+		dashUpdate(dash, workerKey, fmt.Sprintf("%d/%d (interrupted)", stateSkipped+report.Processed+report.Failed, totalLetters), "working")
+		log.Printf("[WARN] [USER] ======== SHUTDOWN %s → %s: %d ok, %d failed, %d skipped ========",
+			params.SourceUser.Email, params.TargetUser.Email,
+			report.Processed, report.Failed, report.Skipped)
+	} else if report.Failed > 0 {
 		st.markUserError(params.SourceUser.Email, fmt.Sprintf("%d failed", report.Failed))
 		dashUpdate(dash, workerKey, fmt.Sprintf("%d/%d ok, %d failed", stateSkipped+report.Processed, totalLetters, report.Failed), "error")
 	} else {

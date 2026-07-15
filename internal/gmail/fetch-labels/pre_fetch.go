@@ -9,7 +9,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/pterm/pterm"
+	tea "github.com/charmbracelet/bubbletea"
+	ltable "github.com/charmbracelet/lipgloss/table"
+	"github.com/charmbracelet/lipgloss"
 	"gwsferry/internal/gmail/gmailapi"
 	"gwsferry/internal/gmail/fetch-labels/store"
 )
@@ -27,6 +29,111 @@ type fetchWorkerState struct {
 	collected int
 	page      int
 }
+
+// === Pre-fetch Bubble Tea model ===
+
+type preFetchTickMsg struct{}
+
+var (
+	pfColorWhite   = lipgloss.Color("15")
+	pfColorMagenta = lipgloss.Color("13")
+	pfColorBgBlue  = lipgloss.Color("12")
+	pfColorBlack   = lipgloss.Color("0")
+	pfColor240     = lipgloss.Color("240")
+	pfStyleHeader  = lipgloss.NewStyle().Background(pfColorBgBlue).Foreground(pfColorBlack).Bold(true)
+)
+
+type preFetchModel struct {
+	fetchMu    *sync.Mutex
+	workers    []fetchWorkerState
+	doneTotal  *int
+	fetchTotal int
+	done       chan struct{}
+}
+
+func (m preFetchModel) Init() tea.Cmd {
+	return tea.Batch(
+		tea.EnterAltScreen,
+		m.tickCmd(),
+	)
+}
+
+func (m preFetchModel) tickCmd() tea.Cmd {
+	return tea.Every(200*time.Millisecond, func(t time.Time) tea.Msg {
+		return preFetchTickMsg{}
+	})
+}
+
+func (m preFetchModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	switch msg := msg.(type) {
+	case preFetchTickMsg:
+		select {
+		case <-m.done:
+			return m, tea.Quit
+		default:
+		}
+		return m, m.tickCmd()
+	case tea.KeyMsg:
+		if msg.Type == tea.KeyCtrlC {
+			return m, tea.Quit
+		}
+	}
+	return m, nil
+}
+
+func (m preFetchModel) View() string {
+	m.fetchMu.Lock()
+	workers := make([]fetchWorkerState, len(m.workers))
+	copy(workers, m.workers)
+	doneTotal := *m.doneTotal
+	m.fetchMu.Unlock()
+
+	pct := 0
+	if m.fetchTotal > 0 {
+		pct = doneTotal * 100 / m.fetchTotal
+	}
+
+	header := pfStyleHeader.Render(fmt.Sprintf("Pre-fetch msg_id [%d%%] %d/%d", pct, doneTotal, m.fetchTotal))
+
+	var rows [][]string
+	for i, w := range workers {
+		task := "—"
+		if w.task != "" && w.task != "done" {
+			task = w.task
+		}
+		status := "—"
+		if w.page > 0 {
+			status = fmt.Sprintf("%d msg_id, стр. %d", w.collected, w.page)
+		}
+		rows = append(rows, []string{
+			fmt.Sprintf("sa%d", i),
+			task,
+			status,
+		})
+	}
+
+	t := ltable.New().
+		Border(lipgloss.NormalBorder()).
+		BorderHeader(true).
+		BorderColumn(true).
+		BorderRow(true).
+		BorderStyle(lipgloss.NewStyle().Foreground(pfColor240)).
+		Headers("WORKER", "ЗАДАЧА", "СТАТУС").
+		StyleFunc(func(row, col int) lipgloss.Style {
+			if row == ltable.HeaderRow {
+				return lipgloss.NewStyle().Foreground(pfColorMagenta).Bold(true).Padding(0, 1)
+			}
+			return lipgloss.NewStyle().Padding(0, 1).Foreground(pfColorWhite)
+		})
+
+	for _, row := range rows {
+		t.Row(row...)
+	}
+
+	return lipgloss.JoinVertical(lipgloss.Left, header, "", t.Render())
+}
+
+// === Main function ===
 
 func preFetchMsgIDs(ctx context.Context, emails []string, validKeys []string, st *store.Store, n int) {
 	start := time.Now()
@@ -61,6 +168,9 @@ func preFetchMsgIDs(ctx context.Context, emails []string, validKeys []string, st
 			log.Printf("[DEBUG] [PRE-FETCH] воркер %d запущен", idx)
 
 			for e := range fetchEmailCh {
+				if ctx.Err() != nil {
+					return
+				}
 				shortEmail := strings.Split(e, "@")[0]
 				fetchMu.Lock()
 				fetchWorkers[idx].task = shortEmail
@@ -96,69 +206,20 @@ func preFetchMsgIDs(ctx context.Context, emails []string, validKeys []string, st
 		}(i)
 	}
 
-	prefetchArea, _ := pterm.DefaultArea.WithRemoveWhenDone().Start()
-	fetchDoneCh := make(chan struct{})
-	fetchGoroutineDone := make(chan struct{})
-	go func() {
-		defer close(fetchGoroutineDone)
-		ticker := time.NewTicker(200 * time.Millisecond)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-fetchDoneCh:
-				return
-			case <-ticker.C:
-				fetchMu.Lock()
-				workers := make([]fetchWorkerState, n)
-				copy(workers, fetchWorkers)
-				doneTotal := fetchDoneTotal
-				fetchMu.Unlock()
+	// Bubble Tea program
+	done := make(chan struct{})
+	m := preFetchModel{
+		fetchMu:    &fetchMu,
+		workers:    fetchWorkers,
+		doneTotal:  &fetchDoneTotal,
+		fetchTotal: fetchTotal,
+		done:       done,
+	}
+	p := tea.NewProgram(m, tea.WithAltScreen())
+	go p.Run()
 
-				pct := 0
-				if fetchTotal > 0 {
-					pct = doneTotal * 100 / fetchTotal
-				}
-
-				cols := []string{"WORKER", "ЗАДАЧА", "СТАТУС"}
-				var rows [][]string
-				for i, w := range workers {
-					task := "—"
-					if w.task != "" && w.task != "done" {
-						task = w.task
-					}
-					status := "—"
-					if w.page > 0 {
-						status = fmt.Sprintf("%d msg_id, стр. %d", w.collected, w.page)
-					}
-					rows = append(rows, []string{
-						fmt.Sprintf("sa%d", i),
-						task,
-						status,
-					})
-				}
-
-				tbl, _ := pterm.DefaultTable.
-					WithHasHeader().
-					WithBoxed().
-					WithHeaderRowSeparator("═").
-					WithRowSeparator("─").
-					WithSeparator("│").
-					WithStyle(pterm.NewStyle(pterm.FgLightWhite)).
-					WithHeaderStyle(pterm.NewStyle(pterm.FgLightMagenta, pterm.Bold)).
-					WithData(append([][]string{cols}, rows...)).
-					Srender()
-
-				header := pterm.DefaultHeader.
-					WithBackgroundStyle(pterm.NewStyle(pterm.BgLightBlue)).
-					WithTextStyle(pterm.NewStyle(pterm.FgBlack, pterm.Bold)).
-					Sprintf("Pre-fetch msg_id [%d%%] %d/%d", pct, doneTotal, fetchTotal)
-
-				prefetchArea.Update(header + "\n\n" + tbl)
-			}
-		}
-	}()
-
-	for done := 0; done < fetchTotal; done++ {
+	// Collect results
+	for doneCount := 0; doneCount < fetchTotal; doneCount++ {
 		r := <-fetchResults
 		fetchMu.Lock()
 		if r.err != nil {
@@ -171,11 +232,8 @@ func preFetchMsgIDs(ctx context.Context, emails []string, validKeys []string, st
 	}
 	fetchWg.Wait()
 	time.Sleep(300 * time.Millisecond)
-	close(fetchDoneCh)
-	<-fetchGoroutineDone
-	prefetchArea.Stop()
-	fmt.Print("\033[2J\033[H")
-	os.Stdout.Sync()
+	close(done)
+	p.Wait()
 
 	log.Printf("[INFO] [PRE-FETCH] завершён: %d/%d (за %s)", fetchDoneTotal, fetchTotal, time.Since(start))
 

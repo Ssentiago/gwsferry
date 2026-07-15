@@ -42,9 +42,10 @@ type ImapWorker struct {
 	conn           *imapclient.Client
 	sharedToken    *SharedToken
 	createdFolders *sync.Map
+	statusFn       func(status string) // callback для обновления статуса в dashboard
 }
 
-func NewImapWorker(user yandexapi.User, api *yandexapi.API, clientID, clientSecret string, sharedToken *SharedToken, createdFolders *sync.Map) *ImapWorker {
+func NewImapWorker(user yandexapi.User, api *yandexapi.API, clientID, clientSecret string, sharedToken *SharedToken, createdFolders *sync.Map, statusFn func(string)) *ImapWorker {
 	return &ImapWorker{
 		email:          user.Email,
 		api:            api,
@@ -53,6 +54,7 @@ func NewImapWorker(user yandexapi.User, api *yandexapi.API, clientID, clientSecr
 		userID:         user.ID,
 		sharedToken:    sharedToken,
 		createdFolders: createdFolders,
+		statusFn:       statusFn,
 	}
 }
 
@@ -65,10 +67,28 @@ func (w *ImapWorker) Append(ctx context.Context, letter Letter, dateFromHeader t
 	folderCreated := false
 	var lastErr error
 	for attempt := 0; attempt <= maxRetries; attempt++ {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
 		if attempt > 0 {
 			delay := backoffDelays[attempt-1]
 			log.Printf("[DEBUG] [IMAP-W] %s: retry %d/%d after %s", w.email, attempt, maxRetries, delay)
-			time.Sleep(delay)
+			// Обратный отсчёт в dashboard
+			if w.statusFn != nil {
+				w.statusFn(fmt.Sprintf("retry %d/%d, backoff %s", attempt, maxRetries, delay))
+			}
+			remaining := delay
+			for remaining > 0 {
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				case <-time.After(time.Second):
+					remaining -= time.Second
+					if remaining > 0 && w.statusFn != nil {
+						w.statusFn(fmt.Sprintf("retry %d/%d, %ds", attempt, maxRetries, int(remaining.Seconds())))
+					}
+				}
+			}
 		}
 
 		if w.conn == nil {

@@ -23,6 +23,21 @@ type app struct {
 	cfg      *config.Config
 }
 
+// onNetErr — обработка сетевой ошибки с учётом shutdown.
+// Если shutdown: помечает юзера pending, выходит из воркера.
+// Если обычная ошибка: логирует, бампит ошибку.
+func (a *app) onNetErr(workerKey, email, shortEmail, op string, err error) (shutdown bool) {
+	if a.shutdown.IsSet() {
+		log.Printf("[DEBUG] [%s] shutdown прервал %s для %s", workerKey, op, shortEmail)
+		setUserStatus(a.st, email, "pending", "", a.cfg.StateFile)
+		return true
+	}
+	a.dash.Log("ERROR", fmt.Sprintf("[%s] %s для %s: %v", workerKey, op, shortEmail, err))
+	log.Printf("[ERROR] [USER] %s: %s %s: %v", workerKey, op, shortEmail, err)
+	a.bumpError()
+	return false
+}
+
 func (a *app) bumpDone() {
 	a.dash.UpdateOverall(func(o *dashboard.OverallState) {
 		o.UsersDone++
@@ -50,8 +65,7 @@ func (a *app) worker(ctx context.Context, idx int, saKeyPath string, emailCh cha
 	if stagger > 0 {
 		a.dash.UpdateWorker(workerKey, "IDLE", fmt.Sprintf("старт через %s", stagger), "")
 		log.Printf("[DEBUG] [%s] Stagger %s", workerKey, stagger)
-		time.Sleep(stagger)
-		if a.shutdown.IsSet() {
+		if util.SleepOrShutdown(a.shutdown, stagger) {
 			log.Printf("[DEBUG] [%s] Stagger прерван shutdown", workerKey)
 			return
 		}
@@ -87,9 +101,9 @@ func (a *app) worker(ctx context.Context, idx int, saKeyPath string, emailCh cha
 
 		svc, err := buildGmailClient(saKeyPath, email)
 		if err != nil {
-			a.dash.Log("ERROR", fmt.Sprintf("[%s] Клиент для %s не собран: %v", workerKey, email, err))
-			log.Printf("[ERROR] [USER] %s: BuildClient для %s: %v", workerKey, email, err)
-			a.bumpError()
+			if a.onNetErr(workerKey, email, shortEmail, "BuildClient", err) {
+				return
+			}
 			continue
 		}
 
@@ -99,9 +113,9 @@ func (a *app) worker(ctx context.Context, idx int, saKeyPath string, emailCh cha
 				a.dash.UpdateWorker(workerKey, shortEmail, fmt.Sprintf("Gmail %d стр.%d", collected, page), "")
 		})
 		if err != nil {
-			a.dash.Log("ERROR", fmt.Sprintf("[%s] Листинг %s не удался: %v", workerKey, email, err))
-			log.Printf("[ERROR] [USER] %s: ListAllMessageIDs %s: %v", workerKey, email, err)
-			a.bumpError()
+			if a.onNetErr(workerKey, email, shortEmail, "ListAllMessageIDs", err) {
+				return
+			}
 			continue
 		}
 
@@ -120,6 +134,10 @@ func (a *app) worker(ctx context.Context, idx int, saKeyPath string, emailCh cha
 		a.dash.UpdateWorker(workerKey, shortEmail, fmt.Sprintf("S3 листинг... Gmail=%d", total), "")
 		existingInS3, err := getExistingMsgIDs(ctx, a.s3client, a.cfg.S3.Bucket, s3Prefix)
 		if err != nil {
+			if a.shutdown.IsSet() {
+				setUserStatus(a.st, email, "pending", "", a.cfg.StateFile)
+				return
+			}
 			a.dash.Log("WARN", fmt.Sprintf("[%s] Ошибка листинга S3 для %s: %v", workerKey, shortEmail, err))
 			log.Printf("[WARN] [%s] Ошибка листинга S3 для %s: %v", workerKey, shortEmail, err)
 			existingInS3 = make(map[string]struct{})
@@ -147,6 +165,8 @@ func (a *app) worker(ctx context.Context, idx int, saKeyPath string, emailCh cha
 		retryRound := 0
 		concurrentRetryRound := 0
 		adaptive := newAdaptiveBatchSize()
+
+		a.dash.UpdateWorkerDetail(workerKey, fmt.Sprintf("0/%d", maxRetries), fmt.Sprintf("%d", adaptive.current))
 
 		for len(pendingIDs) > 0 && retryRound < maxRetries {
 			if a.shutdown.IsSet() {
@@ -190,6 +210,10 @@ func (a *app) worker(ctx context.Context, idx int, saKeyPath string, emailCh cha
 						fatalQuota = true
 						break
 					}
+					if a.shutdown.IsSet() {
+						setUserStatus(a.st, email, "pending", "", a.cfg.StateFile)
+						return
+					}
 					errorLog = append(errorLog, fmt.Sprintf("batch error: %v", batchErr))
 					nextPending = append(nextPending, chunk...)
 					continue
@@ -211,10 +235,9 @@ func (a *app) worker(ctx context.Context, idx int, saKeyPath string, emailCh cha
 				}
 
 				a.dash.UpdateWorker(workerKey, shortEmail, fmt.Sprintf("S3=%d/%d, качаем %d/%d", s3Count+downloaded, total, downloaded, len(missing)), "")
+				a.dash.UpdateWorkerDetail(workerKey, fmt.Sprintf("%d/%d", retryRound+1, maxRetries), fmt.Sprintf("%d", adaptive.current))
 
-				if !a.shutdown.IsSet() {
-					time.Sleep(interBatchDelay)
-				}
+				util.SleepOrShutdown(a.shutdown, interBatchDelay)
 			}
 
 			if fatalQuota {
@@ -244,12 +267,15 @@ func (a *app) worker(ctx context.Context, idx int, saKeyPath string, emailCh cha
 
 			a.dash.Log("WARN", fmt.Sprintf("[%s] %s: %d на retry, пауза %s", workerKey, shortEmail, len(pendingIDs), delay))
 			log.Printf("[DEBUG] [%s] %s: retry_round=%d, delay=%s, pending=%d", workerKey, shortEmail, retryRound, delay, len(pendingIDs))
-			time.Sleep(delay)
+			if util.SleepOrShutdown(a.shutdown, delay) {
+				break
+			}
 		}
 
 		if fatalQuota {
 			a.dash.Log("WARN", fmt.Sprintf("[%s] Суточная квота исчерпана на %s, возвращаем в пул (%d/%d уже скачано)", workerKey, email, downloaded, len(missing)))
 			a.dash.UpdateWorker(workerKey, "DAILY QUOTA", "DEAD", "")
+			a.dash.SetWorkerDeadQuota(workerKey, true)
 			requeue <- email
 			return
 		}

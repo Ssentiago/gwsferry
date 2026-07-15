@@ -29,39 +29,65 @@ func runMessagesGoroutine(
 	taskChan <-chan LetterTask,
 	msgReportChan chan<- MessageReport,
 ) {
-	for task := range taskChan {
-		start := time.Now()
-		report := MessageReport{MsgID: task.Letter.MsgID}
-		letter := task.Letter
+	// При отмене ctx — закрываем IMAP соединение чтобы прервать зависшие операции
+	go func() {
+		<-ctx.Done()
+		worker.Close()
+	}()
 
-		folder := ResolveFolder(letter.LabelIDs, letter.LabelNames)
-		flags := ResolveFlags(letter.LabelIDs)
-		log.Printf("[INFO] [MSG] %s: start (path=%s folder=%s flags=%v)", letter.MsgID, letter.Path, folder, flags)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case task, ok := <-taskChan:
+			if !ok {
+				return
+			}
+			start := time.Now()
+			report := MessageReport{MsgID: task.Letter.MsgID}
+			letter := task.Letter
 
-		// 1. Download .eml from S3
-		raw, err := s3.GetEmail(ctx, letter.Path)
-		if err != nil {
-			log.Printf("[ERROR] [MSG] %s: GetEmail FAILED key=%s: %v", letter.MsgID, letter.Path, err)
-			report.Err = fmt.Errorf("get email: %w", err)
-			msgReportChan <- report
-			continue
+			folder := ResolveFolder(letter.LabelIDs, letter.LabelNames)
+			flags := ResolveFlags(letter.LabelIDs)
+			log.Printf("[INFO] [MSG] %s: start (path=%s folder=%s flags=%v)", letter.MsgID, letter.Path, folder, flags)
+
+			// 1. Download .eml from S3
+			raw, err := s3.GetEmail(ctx, letter.Path)
+			if err != nil {
+				log.Printf("[ERROR] [MSG] %s: GetEmail FAILED key=%s: %v", letter.MsgID, letter.Path, err)
+				report.Err = fmt.Errorf("get email: %w", err)
+				select {
+				case msgReportChan <- report:
+				case <-ctx.Done():
+					return
+				}
+				continue
+			}
+			log.Printf("[DEBUG] [MSG] %s: S3 OK size=%d %s", letter.MsgID, len(raw), time.Since(start))
+
+			// 2. Parse date
+			date := parseDateFromRaw(raw)
+
+			// 3. Append via IMAP
+			appendStart := time.Now()
+			if err := worker.Append(ctx, letter, date, raw); err != nil {
+				log.Printf("[ERROR] [MSG] %s: append FAILED folder=%s: %v (%s)", letter.MsgID, folder, err, time.Since(appendStart))
+				report.Err = fmt.Errorf("append: %w", err)
+				select {
+				case msgReportChan <- report:
+				case <-ctx.Done():
+					return
+				}
+				continue
+			}
+
+			log.Printf("[INFO] [MSG] %s: OK folder=%s (%s total)", letter.MsgID, folder, time.Since(start))
+			select {
+			case msgReportChan <- report:
+			case <-ctx.Done():
+				return
+			}
 		}
-		log.Printf("[DEBUG] [MSG] %s: S3 OK size=%d %s", letter.MsgID, len(raw), time.Since(start))
-
-		// 2. Parse date
-		date := parseDateFromRaw(raw)
-
-		// 3. Append via IMAP
-		appendStart := time.Now()
-		if err := worker.Append(ctx, letter, date, raw); err != nil {
-			log.Printf("[ERROR] [MSG] %s: append FAILED folder=%s: %v (%s)", letter.MsgID, folder, err, time.Since(appendStart))
-			report.Err = fmt.Errorf("append: %w", err)
-			msgReportChan <- report
-			continue
-		}
-
-		log.Printf("[INFO] [MSG] %s: OK folder=%s (%s total)", letter.MsgID, folder, time.Since(start))
-		msgReportChan <- report
 	}
 }
 

@@ -23,6 +23,18 @@ type app struct {
 	shutdown *util.ShutdownFlag
 }
 
+// onNetErr — обработка сетевой ошибки с учётом shutdown.
+func (a *app) onNetErr(workerKey, email, shortEmail, op string, err error) (shutdown bool) {
+	if a.shutdown.IsSet() {
+		log.Printf("[DEBUG] [%s] shutdown прервал %s для %s", workerKey, op, shortEmail)
+		return true
+	}
+	a.dash.Log("ERROR", fmt.Sprintf("[%s] %s для %s: %v", workerKey, op, shortEmail, err))
+	log.Printf("[ERROR] [WORKER] %s: %s %s: %v", workerKey, op, shortEmail, err)
+	a.bumpError()
+	return false
+}
+
 func (a *app) bumpDone() {
 	a.dash.UpdateOverall(func(o *dashboard.OverallState) {
 		o.UsersDone++
@@ -98,9 +110,9 @@ func (a *app) worker(ctx context.Context, idx int, saKeyPath string, emailCh cha
 		log.Printf("[INFO] [WORKER] %s: начало обработки %s", workerKey, email)
 		svc, err := gmailapi.BuildClient(ctx, saKeyPath, email)
 		if err != nil {
-			a.dash.Log("ERROR", fmt.Sprintf("[%s] Клиент для %s не собран: %v", workerKey, email, err))
-			log.Printf("[ERROR] [WORKER] %s: BuildClient для %s: %v", workerKey, email, err)
-			a.bumpError()
+			if a.onNetErr(workerKey, email, shortEmail, "BuildClient", err) {
+				return
+			}
 			continue
 		}
 
@@ -112,9 +124,9 @@ func (a *app) worker(ctx context.Context, idx int, saKeyPath string, emailCh cha
 				a.dash.UpdateWorker(workerKey, shortEmail, fmt.Sprintf("индексация: %d писем, стр. %d", collected, page), "")
 			})
 			if err != nil {
-				a.dash.Log("ERROR", fmt.Sprintf("[%s] Листинг %s не удался: %v", workerKey, email, err))
-				log.Printf("[ERROR] [WORKER] %s: ListAllMessageIDs %s: %v (за %s)", workerKey, email, err, time.Since(listStart))
-				a.bumpError()
+				if a.onNetErr(workerKey, email, shortEmail, "ListAllMessageIDs", err) {
+					return
+				}
 				continue
 			}
 			log.Printf("[DEBUG] [WORKER] %s: %s: %d msg_ids (за %s)", workerKey, email, len(msgIDs), time.Since(listStart))
@@ -124,9 +136,9 @@ func (a *app) worker(ctx context.Context, idx int, saKeyPath string, emailCh cha
 		if total == 0 {
 			names, err := gmailapi.FetchLabelNames(ctx, svc, email)
 			if err != nil {
-				a.dash.Log("ERROR", fmt.Sprintf("[%s] %s: labels.list не удался (%v), юзер НЕ помечен как done", workerKey, shortEmail, err))
-				log.Printf("[ERROR] [WORKER] %s: %s: FetchLabelNames: %v", workerKey, email, err)
-				a.bumpError()
+				if a.onNetErr(workerKey, email, shortEmail, "FetchLabelNames", err) {
+					return
+				}
 				continue
 			}
 			a.st.FinalizeUser(email, names)
@@ -152,6 +164,8 @@ func (a *app) worker(ctx context.Context, idx int, saKeyPath string, emailCh cha
 		adaptive := newAdaptiveBatchSize()
 		eta := etatracker.New(0.3)
 		eta.Record(collected)
+
+		a.dash.UpdateWorkerDetail(workerKey, fmt.Sprintf("0/%d", maxRetries), fmt.Sprintf("%d", adaptive.current))
 
 		fatalQuota := false
 		var errorLog []string
@@ -191,6 +205,9 @@ func (a *app) worker(ctx context.Context, idx int, saKeyPath string, emailCh cha
 						fatalQuota = true
 						break
 					}
+					if a.shutdown.IsSet() {
+						return
+					}
 					errorLog = append(errorLog, fmt.Sprintf("batch error: %v", err))
 					nextPending = append(nextPending, chunk...)
 					continue
@@ -213,10 +230,9 @@ func (a *app) worker(ctx context.Context, idx int, saKeyPath string, emailCh cha
 				remaining := total - collected
 				etaStr := etatracker.FormatETA(eta.EstimateSeconds(remaining))
 				a.dash.UpdateWorker(workerKey, shortEmail, fmt.Sprintf("%d/%d", collected, total), etaStr)
+				a.dash.UpdateWorkerDetail(workerKey, fmt.Sprintf("%d/%d", retryRound+1, maxRetries), fmt.Sprintf("%d", adaptive.current))
 
-				if !a.shutdown.IsSet() {
-					time.Sleep(interBatchDelay)
-				}
+				util.SleepOrShutdown(a.shutdown, interBatchDelay)
 			}
 
 			if fatalQuota {
@@ -245,7 +261,9 @@ func (a *app) worker(ctx context.Context, idx int, saKeyPath string, emailCh cha
 			}
 
 			a.dash.Log("WARN", fmt.Sprintf("[%s] %s: %d на retry, пауза %s", workerKey, shortEmail, len(pending), delay))
-			time.Sleep(delay)
+			if util.SleepOrShutdown(a.shutdown, delay) {
+				break
+			}
 		}
 
 		if fatalQuota {
@@ -275,9 +293,9 @@ func (a *app) worker(ctx context.Context, idx int, saKeyPath string, emailCh cha
 
 		names, err := gmailapi.FetchLabelNames(ctx, svc, email)
 		if err != nil {
-			a.dash.Log("ERROR", fmt.Sprintf("[%s] %s: labels.list не удался (%v), юзер НЕ помечен как done", workerKey, shortEmail, err))
-			log.Printf("[ERROR] [WORKER] %s: %s: FetchLabelNames: %v", workerKey, email, err)
-			a.bumpError()
+			if a.onNetErr(workerKey, email, shortEmail, "FetchLabelNames(final)", err) {
+				return
+			}
 			continue
 		}
 		a.st.FinalizeUser(email, names)

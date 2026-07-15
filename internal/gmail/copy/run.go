@@ -204,28 +204,57 @@ func Run(cfg *config.Config) {
 
 	dash := dashboard.New()
 	dash.Start()
+	go func() {
+		<-dash.QuitCh()
+		if !shutdown.IsSet() {
+			shutdown.Set()
+		}
+		log.Println("[WARN] [SHUTDOWN] Ctrl+C: принудительный выход через 5с.")
+		go func() {
+			time.Sleep(5 * time.Second)
+			saveState(st, statePath)
+			os.Exit(0)
+		}()
+	}()
 	dash.StartTimer()
-	defer dash.Stop()
 	dash.UpdateOverall(func(o *dashboard.OverallState) {
 		o.UsersTotal = len(emails)
 		o.UsersDone = skipped
 		o.UsersPending = len(pending)
+		o.MemoryLimit = memoryLimitMB
 	})
 
-	log.Printf("[INFO] [RUN] signal handler установлен (SIGINT/SIGTERM/SIGWINCH)")
+	// RSS memory ticker
+	go func() {
+		ticker := time.NewTicker(10 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				rss := getRSSMB()
+				dash.UpdateOverall(func(o *dashboard.OverallState) {
+					o.MemoryMB = rss
+				})
+			case <-shutdown.Done():
+				return
+			}
+		}
+	}()
+
+	log.Printf("[INFO] [RUN] signal handler установлен (SIGTERM/SIGWINCH)")
 	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM, syscall.SIGWINCH)
+	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGWINCH)
 	go func() {
 		for sig := range sigCh {
 			switch sig {
 			case syscall.SIGWINCH:
-				dash.ForceRedraw()
-			case syscall.SIGINT, syscall.SIGTERM:
+				dash.ForwardWindowSize()
+			case syscall.SIGTERM:
 				if shutdown.IsSet() {
 					continue
 				}
 				shutdown.Set()
-				log.Println("[WARN] [SHUTDOWN] Получен сигнал остановки.")
+				log.Println("[WARN] [SHUTDOWN] SIGTERM: принудительный выход через 5с.")
 				go func() {
 					time.Sleep(5 * time.Second)
 					saveState(st, statePath)
@@ -255,7 +284,7 @@ func Run(cfg *config.Config) {
 	var wg sync.WaitGroup
 	for i := 0; i < n; i++ {
 		wg.Add(1)
-		go a.worker(ctx, i, validKeys[i], emailCh, requeue, &wg)
+		go a.worker(shutdown.Context(), i, validKeys[i], emailCh, requeue, &wg)
 	}
 
 	wg.Wait()
@@ -272,6 +301,7 @@ func Run(cfg *config.Config) {
 
 	elapsed := time.Since(start)
 	log.Printf("[INFO] [RUN] завершено за %s, requeued=%d", elapsed, len(requeued))
+	dash.Stop()
 	fmt.Println()
 	if len(requeued) > 0 {
 		pterm.Warning.Printfln("=== STOPPED in %s, %d users pending ===", elapsed, len(requeued))
