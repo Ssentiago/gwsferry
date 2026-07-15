@@ -21,9 +21,9 @@ const (
 )
 
 var backoffDelays = [maxRetries]time.Duration{
-	1 * time.Second,
-	2 * time.Second,
-	4 * time.Second,
+	5 * time.Second,
+	10 * time.Second,
+	20 * time.Second,
 }
 
 // SharedToken — shared token across all workers for the same user.

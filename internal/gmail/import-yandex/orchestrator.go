@@ -18,6 +18,8 @@ import (
 // OrchestratorParams — всё что нужно для запуска импорта.
 type OrchestratorParams struct {
 	Users        []yandexapi.User
+	SourceEmail  string // откуда .eml в S3
+	TargetEmail  string // куда заливаем через IMAP
 	Labels       LabelsFile
 	S3           S3Reader
 	API          *yandexapi.API

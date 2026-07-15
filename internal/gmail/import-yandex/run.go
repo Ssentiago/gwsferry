@@ -20,10 +20,13 @@ import (
 // Если emails пустой — читает из yandex_users.json.
 // modeInfo — строка для отображения в дашборде (например "TEST MODE | target → source").
 func RunImport(cfg *config.Config, emails ...string) error {
-	return RunImportWithMode(cfg, "", emails...)
+	return RunImportWithMode(cfg, "", "", "", emails...)
 }
 
-func RunImportWithMode(cfg *config.Config, modeInfo string, emails ...string) error {
+// RunImportWithMode — RunImport с поддержкой test mode (source ≠ target).
+// sourceEmail — откуда .eml в S3, targetEmail — куда заливаем через IMAP.
+// emails — список юзеров для импорта (пустой = из файла).
+func RunImportWithMode(cfg *config.Config, modeInfo string, sourceEmail string, targetEmail string, emails ...string) error {
 	// Лог-файл
 	logPath := "yandex_import.log"
 	logf, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
@@ -168,6 +171,10 @@ func RunImportWithMode(cfg *config.Config, modeInfo string, emails ...string) er
 	pterm.Info.Printfln("User workers:         %d", cfg.Yandex.UserWorkers)
 	pterm.Info.Printfln("Msg workers/user:     %d", MsgWorkers)
 	pterm.Info.Printfln("IMAP target:          %s", imapHost)
+	if sourceEmail != "" {
+		pterm.Info.Printfln("Source (S3):          %s", sourceEmail)
+		pterm.Info.Printfln("Target (IMAP):        %s", targetEmail)
+	}
 	pterm.Info.Printfln("Log file:             %s", logPath)
 	pterm.Info.Printfln("State file:           %s", statePath)
 	pterm.Info.Printfln("Labels file:          %s", labelsFile)
@@ -225,6 +232,8 @@ func RunImportWithMode(cfg *config.Config, modeInfo string, emails ...string) er
 	// ==============================
 	params := OrchestratorParams{
 		Users:        userList,
+		SourceEmail:  sourceEmail,
+		TargetEmail:  targetEmail,
 		Labels:       labels,
 		S3:           s3Client,
 		API:          api,

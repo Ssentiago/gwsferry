@@ -145,7 +145,7 @@ func runTestMode(cfg *config.Config) error {
 	log.Printf("[INFO] [TEST] запуск импорта: source=%s", sourceEmail)
 	pterm.Info.Printfln("Запуск импорта для %s...", sourceEmail)
 	modeInfo := fmt.Sprintf("TEST MODE  |  %s → %s", sourceEmail, target)
-	if err := importyandex.RunImportWithMode(cfg, modeInfo, sourceEmail); err != nil {
+	if err := importyandex.RunImportWithMode(cfg, modeInfo, sourceEmail, target); err != nil {
 		return fmt.Errorf("импорт: %w", err)
 	}
 

@@ -38,17 +38,29 @@ func runUserGoroutine(
 	dash *dashboard.Dashboard,
 ) {
 	for user := range userChan {
+		// Определяем source и target для этого юзера
+		// В обычном режиме source = target = user.Email
+		// В test mode source и target заданы явно
+		sourceEmail := user.Email
+		targetEmail := user.Email
+		if params.SourceEmail != "" {
+			sourceEmail = params.SourceEmail
+		}
+		if params.TargetEmail != "" {
+			targetEmail = params.TargetEmail
+		}
 		start := time.Now()
 		report := UserReport{Email: user.Email}
 		workerKey := user.Email
 
-		log.Printf("[INFO] [USER] ======== НАЧАЛО обработки %s (uid=%d) ========", user.Email, user.ID)
+		log.Printf("[INFO] [USER] ======== НАЧАЛО обработки %s (uid=%d) source=%s target=%s ========",
+			user.Email, user.ID, sourceEmail, targetEmail)
 
 		dashUpdate(dash, workerKey, "загрузка лейблов", "working")
 
-		// Загружаем письма из S3 + лейблы
-		log.Printf("[INFO] [USER] %s: загружаю письма из S3 и матчу с лейблами...", user.Email)
-		letters, warnings, err := BuildLetters(ctx, params.S3, user.Email, params.Labels)
+		// Загружаем письма из S3 + лейблы (по SOURCE email)
+		log.Printf("[INFO] [USER] %s: загружаю письма из S3 (source=%s) и матчу с лейблами...", user.Email, sourceEmail)
+		letters, warnings, err := BuildLetters(ctx, params.S3, sourceEmail, params.Labels)
 		if err != nil {
 			log.Printf("[ERROR] [USER] %s: BuildLetters failed: %v", user.Email, err)
 			st.markUserError(user.Email, err.Error())
@@ -123,12 +135,22 @@ func runUserGoroutine(
 		log.Printf("[INFO] [USER] %s: pre-fetch существующих msgID в TARGET для %d папок: %v", user.Email, len(uniqueFolders), uniqueFolders)
 
 		// Подключаемся к TARGET (Yandex IMAP) для проверки дедупа
-		preFetchWorker := NewImapWorker(user, params.API, params.ClientID, params.ClientSecret, &SharedToken{}, nil)
-		existingIDs, err := preFetchWorker.PreFetchExistingIDs(ctx, uniqueFolders)
+		// Retry 1 раз при ошибке перед тем как идти без дедупа
+		var existingIDs map[string]bool
+		// Создаём target-пользователя для IMAP подключения
+		targetUser := yandexapi.User{Email: targetEmail, ID: user.ID}
+		preFetchWorker := NewImapWorker(targetUser, params.API, params.ClientID, params.ClientSecret, &SharedToken{}, nil)
+		existingIDs, err = preFetchWorker.PreFetchExistingIDs(ctx, uniqueFolders)
 		preFetchWorker.Close()
 		if err != nil {
-			log.Printf("[WARN] [USER] %s: pre-fetch target failed: %v, продолжаем без дедупа по серверу", user.Email, err)
-			existingIDs = nil
+			log.Printf("[WARN] [USER] %s: pre-fetch target failed (попытка 1/2): %v, retry...", user.Email, err)
+			preFetchWorker2 := NewImapWorker(targetUser, params.API, params.ClientID, params.ClientSecret, &SharedToken{}, nil)
+			existingIDs, err = preFetchWorker2.PreFetchExistingIDs(ctx, uniqueFolders)
+			preFetchWorker2.Close()
+			if err != nil {
+				log.Printf("[WARN] [USER] %s: pre-fetch target failed (попытка 2/2): %v, продолжаем без дедупа", user.Email, err)
+				existingIDs = nil
+			}
 		}
 
 		// Фильтруем письма которые уже есть на сервере
@@ -177,7 +199,7 @@ func runUserGoroutine(
 			msgWg.Add(1)
 			go func(workerID int) {
 				defer msgWg.Done()
-				worker := NewImapWorker(user, params.API, params.ClientID, params.ClientSecret, sharedToken, createdFolders)
+				worker := NewImapWorker(targetUser, params.API, params.ClientID, params.ClientSecret, sharedToken, createdFolders)
 				log.Printf("[DEBUG] [USER] %s: msg-воркер %d запущен (ImapWorker → TARGET Yandex)", user.Email, workerID)
 				runMessagesGoroutine(ctx, params.S3, worker, taskChan, msgReportChan)
 				worker.Close()
