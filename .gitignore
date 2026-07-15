@@ -38,3 +38,5 @@ yandex_users.json
 /gwsferry-linux-amd64
 
 __pycache__/
+yandex_import.log
+*.tmp
