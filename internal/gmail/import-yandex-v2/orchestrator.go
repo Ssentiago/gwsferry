@@ -13,12 +13,13 @@ import (
 	yandexapi "gwsferry/internal/gmail/import-yandex-v2/api"
 	"gwsferry/internal/shared/dashboard"
 	"gwsferry/internal/shared/etatracker"
+	"gwsferry/internal/shared/util"
 )
 
 // OrchestratorParams — параметры для одного импорта source → target.
 type OrchestratorParams struct {
-	SourceUser   yandexapi.User // чьи письма в S3
-	TargetUser   yandexapi.User // в чей IMAP заливаем
+	SourceUser   yandexapi.User
+	TargetUser   yandexapi.User
 	Labels       LabelsFile
 	S3           S3Reader
 	API          *yandexapi.API
@@ -26,7 +27,7 @@ type OrchestratorParams struct {
 	ClientSecret string
 }
 
-// MsgWorkers — parallelism per user. Константа.
+// MsgWorkers — parallelism per user.
 const MsgWorkers = 25
 
 // UserReport — агрегированный отчёт по импорту.
@@ -46,6 +47,7 @@ func dashUpdate(dash *dashboard.Dashboard, key, task, status string) {
 }
 
 // RunUserImport — импорт писем из SOURCE в TARGET для одного пользователя.
+// Использует ShutdownFlag для graceful shutdown по SIGINT/SIGTERM.
 func RunUserImport(
 	ctx context.Context,
 	params OrchestratorParams,
@@ -57,22 +59,38 @@ func RunUserImport(
 	start := time.Now()
 	report := UserReport{Source: params.SourceUser.Email, Target: params.TargetUser.Email}
 
-	// Signal handler — сохраняем state при Ctrl+C
+	// Shutdown coordination
+	shutdown := util.NewShutdownFlag()
 	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM, syscall.SIGWINCH)
 	go func() {
-		sig := <-sigCh
-		log.Printf("[WARN] [USER] получен сигнал %v, сохраняю состояние...", sig)
-		saveImportState(st, statePath)
-		log.Printf("[WARN] [USER] состояние сохранено, выхожу")
-		os.Exit(0)
+		for sig := range sigCh {
+			switch sig {
+			case syscall.SIGWINCH:
+				if dash != nil {
+					dash.ForceRedraw()
+				}
+			case syscall.SIGINT, syscall.SIGTERM:
+				if shutdown.IsSet() {
+					continue
+				}
+				shutdown.Set()
+				log.Println("[WARN] [SHUTDOWN] Получен сигнал остановки - сохраняю состояние.")
+				go func() {
+					time.Sleep(5 * time.Second)
+					saveImportState(st, statePath)
+					log.Println("[WARN] [SHUTDOWN] Экстренный дамп выполнен.")
+					os.Exit(0)
+				}()
+			}
+		}
 	}()
 
 	log.Printf("[INFO] [USER] ======== ИМПОРТ %s → %s ========", params.SourceUser.Email, params.TargetUser.Email)
 
 	dashUpdate(dash, workerKey, "загрузка лейблов", "working")
 
-	// 1. BuildLetters — загружаем письма из S3 по SOURCE email
+	// 1. BuildLetters
 	log.Printf("[INFO] [USER] загружаю письма из S3 (source=%s)...", params.SourceUser.Email)
 	letters, warnings, err := BuildLetters(ctx, params.S3, params.SourceUser.Email, params.Labels)
 	if err != nil {
@@ -101,17 +119,17 @@ func RunUserImport(
 		}
 		pending = append(pending, l)
 	}
+	totalLetters := len(letters)
 	stateSkipped := report.Skipped - len(warnings)
-	log.Printf("[INFO] [USER] к обработке %d/%d (resume skip %d)", len(pending), len(letters), stateSkipped)
+	log.Printf("[INFO] [USER] к обработке %d/%d (resume skip %d)", len(pending), totalLetters, stateSkipped)
 
 	if len(pending) == 0 {
 		st.markUserDone(params.SourceUser.Email)
-		dashUpdate(dash, workerKey, "уже импортировано", "done")
+		dashUpdate(dash, workerKey, fmt.Sprintf("%d/%d", totalLetters, totalLetters), "done")
 		return
 	}
 
-	// Показываем начальное состояние: пропущено + осталось
-	dashUpdate(dash, workerKey, fmt.Sprintf("пропущено %d, к обработке %d", stateSkipped, len(pending)), "working")
+	dashUpdate(dash, workerKey, fmt.Sprintf("%d/%d", stateSkipped, totalLetters), "working")
 
 	// 3. Dedup — проверяем TARGET IMAP
 	folderSet := make(map[string]struct{})
@@ -129,17 +147,16 @@ func RunUserImport(
 	existingIDs, err = preFetchWorker.PreFetchExistingIDs(ctx, uniqueFolders)
 	preFetchWorker.Close()
 	if err != nil {
-		log.Printf("[WARN] [USER] pre-fetch failed (попытка 1/2): %v, retry...", err)
-		preFetchWorker2 := NewImapWorker(params.TargetUser, params.API, params.ClientID, params.ClientSecret, &SharedToken{}, nil)
-		existingIDs, err = preFetchWorker2.PreFetchExistingIDs(ctx, uniqueFolders)
-		preFetchWorker2.Close()
+		log.Printf("[WARN] [USER] pre-fetch failed (1/2): %v, retry...", err)
+		w2 := NewImapWorker(params.TargetUser, params.API, params.ClientID, params.ClientSecret, &SharedToken{}, nil)
+		existingIDs, err = w2.PreFetchExistingIDs(ctx, uniqueFolders)
+		w2.Close()
 		if err != nil {
-			log.Printf("[WARN] [USER] pre-fetch failed (попытка 2/2): %v, без дедупа", err)
+			log.Printf("[WARN] [USER] pre-fetch failed (2/2): %v, без дедупа", err)
 			existingIDs = nil
 		}
 	}
 
-	// Фильтруем уже существующие в TARGET
 	var filtered []Letter
 	skippedByServer := 0
 	for _, l := range pending {
@@ -152,14 +169,17 @@ func RunUserImport(
 	if skippedByServer > 0 {
 		log.Printf("[INFO] [USER] пропущено %d (уже в TARGET), к обработке %d", skippedByServer, len(filtered))
 		report.Skipped += skippedByServer
+		stateSkipped += skippedByServer
 	}
 	pending = filtered
 
 	if len(pending) == 0 {
 		st.markUserDone(params.SourceUser.Email)
-		dashUpdate(dash, workerKey, "уже в TARGET", "done")
+		dashUpdate(dash, workerKey, fmt.Sprintf("%d/%d", totalLetters, totalLetters), "done")
 		return
 	}
+
+	dashUpdate(dash, workerKey, fmt.Sprintf("%d/%d", stateSkipped, totalLetters), "working")
 
 	// 4. Append — заливаем в TARGET IMAP
 	taskChan := make(chan LetterTask, len(pending))
@@ -173,7 +193,7 @@ func RunUserImport(
 	msgReportChan := make(chan MessageReport, len(pending))
 
 	eta := etatracker.New(0.3)
-	eta.Record(0) // инициализация
+	eta.Record(0)
 
 	for i := 0; i < MsgWorkers; i++ {
 		go func() {
@@ -191,27 +211,26 @@ func RunUserImport(
 			st.markMessageDone(params.SourceUser.Email, mr.MsgID)
 		}
 		eta.Record(1)
-		remaining := len(pending) - report.Processed - report.Failed
+		done := stateSkipped + report.Processed + report.Failed
+		remaining := totalLetters - done
 		etaStr := etatracker.FormatETA(eta.EstimateSeconds(remaining))
-		// Обновляем task+status+eta одним вызовом чтобы не затереть
 		dash.UpdateWorker(workerKey,
-			fmt.Sprintf("%d/%d", report.Processed+report.Failed, len(pending)),
+			fmt.Sprintf("%d/%d", done, totalLetters),
 			"working", etaStr)
 	}
 
 	if report.Failed > 0 {
 		st.markUserError(params.SourceUser.Email, fmt.Sprintf("%d failed", report.Failed))
-		dashUpdate(dash, workerKey, fmt.Sprintf("%d ok, %d failed", report.Processed, report.Failed), "error")
+		dashUpdate(dash, workerKey, fmt.Sprintf("%d/%d ok, %d failed", stateSkipped+report.Processed, totalLetters, report.Failed), "error")
 	} else {
 		st.markUserDone(params.SourceUser.Email)
-		dashUpdate(dash, workerKey, fmt.Sprintf("%d писем", report.Processed), "done")
+		dashUpdate(dash, workerKey, fmt.Sprintf("%d/%d", totalLetters, totalLetters), "done")
 	}
 
 	log.Printf("[INFO] [USER] ======== ГОТОВО %s → %s: %d ok, %d failed, %d skipped, %s ========",
 		params.SourceUser.Email, params.TargetUser.Email,
 		report.Processed, report.Failed, report.Skipped, time.Since(start))
 
-	// Сохраняем state
 	if statePath != "" {
 		saveImportState(st, statePath)
 	}
