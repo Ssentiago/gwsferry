@@ -51,6 +51,7 @@ type Dashboard struct {
 	generalLogs  []logLine
 	workerLogs   []logLine
 	timer        *timer.Timer
+	modeInfo     string
 }
 
 func New() *Dashboard {
@@ -118,6 +119,14 @@ func (d *Dashboard) UpdateWorker(key, task, status, eta string) {
 func (d *Dashboard) SetStuckThreads(n int) {
 	d.mu.Lock()
 	d.stuckThreads = n
+	d.mu.Unlock()
+	d.redraw()
+}
+
+// SetModeInfo устанавливает строку режима (например "TEST MODE | target → source").
+func (d *Dashboard) SetModeInfo(info string) {
+	d.mu.Lock()
+	d.modeInfo = info
 	d.mu.Unlock()
 	d.redraw()
 }
@@ -190,6 +199,13 @@ func (d *Dashboard) redraw() {
 		WithTextStyle(pterm.NewStyle(pterm.FgBlack, pterm.Bold)).
 		Sprintf("Progress [%d%%]  |  %s", pct, timerStr)
 
+	// === Mode Banner ===
+	modeBanner := ""
+	if d.modeInfo != "" {
+		modeBanner = pterm.NewStyle(pterm.BgYellow, pterm.FgBlack, pterm.Bold).
+			Sprintf("  %s  ", d.modeInfo) + "\n"
+	}
+
 	// === Summary ===
 	summary := fmt.Sprintf(
 		"%s | %s | %s | всего %s",
@@ -253,6 +269,9 @@ func (d *Dashboard) redraw() {
 	var out strings.Builder
 	out.WriteString(header)
 	out.WriteString("\n")
+	if modeBanner != "" {
+		out.WriteString(modeBanner)
+	}
 	out.WriteString(pterm.FgLightWhite.Sprint(summary))
 	out.WriteString("\n\n")
 	out.WriteString(tbl)
