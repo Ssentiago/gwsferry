@@ -7,10 +7,11 @@ import (
 	"os"
 	"path/filepath"
 
+	"gwsferry/internal/gmail/import-yandex"
+	"gwsferry/internal/shared/config"
+
 	"github.com/pterm/pterm"
 	"github.com/spf13/cobra"
-	"gwsferry/internal/gmail/import-yandex-v2"
-	"gwsferry/internal/shared/config"
 )
 
 var (

@@ -9,14 +9,14 @@ import (
 	"sync"
 	"time"
 
-	imaplib "github.com/emersion/go-imap/client"
+	imap "github.com/emersion/go-imap/v2"
+	imapclient "github.com/emersion/go-imap/v2/imapclient"
 
 	yandexapi "gwsferry/internal/gmail/import-yandex/api"
 )
 
 const (
 	maxRetries      = 3
-	backoffBase     = 1 * time.Second
 	tokenRefreshMin = 5 * time.Minute
 )
 
@@ -26,15 +26,11 @@ var backoffDelays = [maxRetries]time.Duration{
 	20 * time.Second,
 }
 
-// SharedToken — shared token across all workers for the same user.
-// One refresh serves all workers, preventing 500 concurrent ExchangeToken calls.
 type SharedToken struct {
 	mu    sync.Mutex
 	token *yandexapi.ExchangeToken
 }
 
-// ImapWorker — persistent IMAP connection per msg goroutine.
-// One worker = one connection = one goroutine. Not shared, not pooled.
 type ImapWorker struct {
 	email        string
 	api          *yandexapi.API
@@ -43,12 +39,11 @@ type ImapWorker struct {
 	userID       yandexapi.UserID
 
 	mu             sync.Mutex
-	conn           *imaplib.Client
+	conn           *imapclient.Client
 	sharedToken    *SharedToken
 	createdFolders *sync.Map
 }
 
-// NewImapWorker создаёт воркер с OAuth2 auth (TARGET: Yandex IMAP).
 func NewImapWorker(user yandexapi.User, api *yandexapi.API, clientID, clientSecret string, sharedToken *SharedToken, createdFolders *sync.Map) *ImapWorker {
 	return &ImapWorker{
 		email:          user.Email,
@@ -61,8 +56,6 @@ func NewImapWorker(user yandexapi.User, api *yandexapi.API, clientID, clientSecr
 	}
 }
 
-// Append appends one email to IMAP with auto-reconnect and retry.
-// Header injection is handled by imap_client.Append.
 func (w *ImapWorker) Append(ctx context.Context, letter Letter, dateFromHeader time.Time, rawMessage []byte) error {
 	folder := ResolveFolder(letter.LabelIDs, letter.LabelNames)
 	flags := ResolveFlags(letter.LabelIDs)
@@ -78,9 +71,8 @@ func (w *ImapWorker) Append(ctx context.Context, letter Letter, dateFromHeader t
 			time.Sleep(delay)
 		}
 
-		// Lazy connect
 		if w.conn == nil {
-			if err := w.connect(); err != nil {
+			if err := w.connect(ctx); err != nil {
 				lastErr = err
 				if isAuthError(err) {
 					w.forceTokenRefresh()
@@ -89,106 +81,114 @@ func (w *ImapWorker) Append(ctx context.Context, letter Letter, dateFromHeader t
 			}
 		}
 
-		// Try append
-		err := Append(ctx, w.conn, folder, dateFromHeader, rawMessage, appendFlags, letter.MsgID)
+		err := w.doAppend(ctx, folder, dateFromHeader, rawMessage, appendFlags, letter.MsgID)
 		if err == nil {
-			// Success — handle \Flagged via STORE
 			if needFlagged {
-				uid := searchByMsgID(w.conn, folder, letter.MsgID)
-				if uid > 0 {
-					if sfErr := StoreFlag(w.conn, folder, uid, `\Flagged`); sfErr != nil {
-						log.Printf("[WARN] [IMAP-W] %s: \\Flagged STORE failed uid=%d: %v", w.email, uid, sfErr)
-					}
-				}
+				w.doStoreFlag(ctx, folder, letter.MsgID, `\Flagged`)
 			}
 			return nil
 		}
 
 		lastErr = err
 
-		// "No such folder" → create folder and retry once
-		if !folderCreated && isNoSuchFolder(err) {
-			// Check shared cache — another worker may have created it already
+		if isNoSuchFolder(err) && !folderCreated {
 			if w.createdFolders != nil {
 				if _, loaded := w.createdFolders.LoadOrStore(folder, true); loaded {
-					log.Printf("[DEBUG] [IMAP-W] %s: folder %q уже создан другим worker'ом, retry append", w.email, folder)
 					folderCreated = true
 					continue
 				}
 			}
 			log.Printf("[INFO] [IMAP-W] %s: folder %q не существует, создаю...", w.email, folder)
-			if crErr := CreateFolderIfNotExists(ctx, w.conn, folder); crErr != nil {
-				log.Printf("[ERROR] [IMAP-W] %s: CreateFolderIfNotExists %q failed: %v", w.email, folder, crErr)
+			if crErr := w.conn.Create(folder, nil).Wait(); crErr != nil {
 				return fmt.Errorf("create folder %q: %w", folder, crErr)
 			}
 			folderCreated = true
-			continue // retry append
+			continue
 		}
 
-		// Transient error (rate limit, "try again later", backend error) → retry with backoff
 		if isTransient(err) {
 			log.Printf("[WARN] [IMAP-W] %s: transient error (attempt %d): %v", w.email, attempt+1, err)
 			continue
 		}
 
-		// Connection lost → reconnect
 		if isConnectionLost(err) {
-			log.Printf("[WARN] [IMAP-W] %s: connection lost, reconnecting (attempt %d)", w.email, attempt+1)
+			log.Printf("[WARN] [IMAP-W] %s: connection lost, reconnecting", w.email)
 			w.closeConn()
-			folderCreated = false // reset — will need to check again after reconnect
+			folderCreated = false
 			continue
 		}
 
-		// Auth error → refresh token + reconnect
 		if isAuthErrorWrapped(err) {
-			log.Printf("[WARN] [IMAP-W] %s: auth error, refreshing token (attempt %d)", w.email, attempt+1)
+			log.Printf("[WARN] [IMAP-W] %s: auth error, refreshing token", w.email)
 			w.closeConn()
 			w.forceTokenRefresh()
 			folderCreated = false
 			continue
 		}
 
-		// Other IMAP error — don't retry
 		return err
 	}
 
 	return fmt.Errorf("append failed after %d retries: %w", maxRetries, lastErr)
 }
 
-// isNoSuchFolder checks if an IMAP error is "No such folder".
-func isNoSuchFolder(err error) bool {
-	if err == nil {
-		return false
+func (w *ImapWorker) doAppend(ctx context.Context, folder string, dateFromHeader time.Time, rawMessage []byte, flags []string, msgID string) error {
+	enriched := injectMsgIDHeader(rawMessage, msgID)
+
+	var flagList []imap.Flag
+	for _, f := range flags {
+		flagList = append(flagList, imap.Flag(f))
 	}
-	msg := strings.ToLower(err.Error())
-	return strings.Contains(msg, "no such folder") ||
-		strings.Contains(msg, "does not exist")
-}
 
-// isTransient checks if an IMAP error is transient and should be retried.
-func isTransient(err error) bool {
-	if err == nil {
-		return false
+	opts := &imap.AppendOptions{
+		Flags: flagList,
+		Time:  dateFromHeader,
 	}
-	msg := strings.ToLower(err.Error())
-	return strings.Contains(msg, "try again later") ||
-		strings.Contains(msg, "failed to store") ||
-		strings.Contains(msg, "backend error") ||
-		strings.Contains(msg, "temporary") ||
-		strings.Contains(msg, "rate limit")
+	cmd := w.conn.Append(folder, int64(len(enriched)), opts)
+
+	if _, err := cmd.Write(enriched); err != nil {
+		return fmt.Errorf("append write: %w", err)
+	}
+	if err := cmd.Close(); err != nil {
+		return fmt.Errorf("append close: %w", err)
+	}
+	if _, err := cmd.Wait(); err != nil {
+		if isConnectionLost(err) {
+			return &ConnectionLostError{Op: "append to " + folder, Err: err}
+		}
+		return err
+	}
+
+	IncrAppend()
+	return nil
 }
 
-// Close closes the persistent connection.
-func (w *ImapWorker) Close() {
-	w.closeConn()
+func (w *ImapWorker) doStoreFlag(ctx context.Context, folder, msgID, flag string) {
+	criteria := &imap.SearchCriteria{
+		Header: []imap.SearchCriteriaHeaderField{
+			{Key: "X-Gwsferry-MsgID", Value: msgID},
+		},
+	}
+	searchResult, err := w.conn.UIDSearch(criteria, nil).Wait()
+	if err != nil {
+		return
+	}
+	uids := searchResult.AllUIDs()
+	if len(uids) == 0 {
+		return
+	}
+
+	numSet := imap.UIDSetNum(uids[0])
+	storeOpts := &imap.StoreFlags{
+		Op:    imap.StoreFlagsAdd,
+		Flags: []imap.Flag{imap.Flag(flag)},
+	}
+	w.conn.Store(numSet, storeOpts, nil).Close()
 }
 
-// PreFetchExistingIDs загружает X-Gwsferry-MsgID для списка папок.
-// Делает один FETCH на папку. Возвращает объединённый map[msgID]bool.
 func (w *ImapWorker) PreFetchExistingIDs(ctx context.Context, folders []string) (map[string]bool, error) {
-	// Лениво подключаемся если ещё нет
 	if w.conn == nil {
-		if err := w.connect(); err != nil {
+		if err := w.connect(ctx); err != nil {
 			return nil, err
 		}
 	}
@@ -208,17 +208,20 @@ func (w *ImapWorker) PreFetchExistingIDs(ctx context.Context, folders []string) 
 	return combined, nil
 }
 
+func (w *ImapWorker) Close() {
+	w.closeConn()
+}
+
 func (w *ImapWorker) closeConn() {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if w.conn != nil {
-		w.conn.Logout()
 		w.conn.Close()
 		w.conn = nil
 	}
 }
 
-func (w *ImapWorker) connect() error {
+func (w *ImapWorker) connect(ctx context.Context) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
@@ -226,13 +229,12 @@ func (w *ImapWorker) connect() error {
 		return nil
 	}
 
-	// OAuth2 auth (TARGET: Yandex IMAP)
 	token, err := w.ensureTokenLocked()
 	if err != nil {
 		return err
 	}
 
-	c, err := ConnectAndAuth(w.email, token.AccessToken)
+	c, err := ConnectAndAuth(ctx, w.email, token.AccessToken)
 	if err != nil {
 		return err
 	}
@@ -242,9 +244,6 @@ func (w *ImapWorker) connect() error {
 	return nil
 }
 
-// ensureTokenLocked refreshes token if it expires within tokenRefreshMin.
-// Uses shared token — one refresh serves all workers.
-// Must be called with w.mu held.
 func (w *ImapWorker) ensureTokenLocked() (*yandexapi.ExchangeToken, error) {
 	st := w.sharedToken
 	st.mu.Lock()
@@ -255,7 +254,7 @@ func (w *ImapWorker) ensureTokenLocked() (*yandexapi.ExchangeToken, error) {
 		if remaining > tokenRefreshMin {
 			return st.token, nil
 		}
-		log.Printf("[DEBUG] [IMAP-W] %s: token expiring in %s, refreshing proactively", w.email, remaining.Round(time.Second))
+		log.Printf("[DEBUG] [IMAP-W] %s: token expiring in %s, refreshing", w.email, remaining.Round(time.Second))
 	}
 
 	token, err := w.api.ExchangeToken(w.clientID, w.clientSecret, w.userID)
@@ -276,6 +275,37 @@ func (w *ImapWorker) forceTokenRefresh() {
 // ==========================================
 // HELPERS
 // ==========================================
+
+func isNoSuchFolder(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "no such folder") ||
+		strings.Contains(msg, "does not exist")
+}
+
+func isTransient(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "try again later") ||
+		strings.Contains(msg, "failed to store") ||
+		strings.Contains(msg, "backend error") ||
+		strings.Contains(msg, "temporary") ||
+		strings.Contains(msg, "rate limit")
+}
+
+func isConnectionLost(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "broken pipe") ||
+		strings.Contains(msg, "connection reset by peer") ||
+		strings.Contains(msg, "connection reset")
+}
 
 func isAuthErrorWrapped(err error) bool {
 	var authErr *ErrAuthFailed

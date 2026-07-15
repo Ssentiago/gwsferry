@@ -12,21 +12,19 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/emersion/go-imap"
-	"github.com/emersion/go-imap/client"
+	"github.com/emersion/go-imap/v2"
+	"github.com/emersion/go-imap/v2/imapclient"
 )
 
 // ==========================================
 // CONFIGURATION
 // ==========================================
 
-// ImapTimeout — timeout for one IMAP operation (Append, List, Fetch, etc.).
 var ImapTimeout = 10 * time.Minute
-
 var imapHost = "imap.yandex.ru:993"
+
 const imapDialTimeout = 30 * time.Second
 
-// SetImapHost переопределяет IMAP хост (для target-сервера).
 func SetImapHost(host string) {
 	if host != "" {
 		imapHost = host
@@ -42,31 +40,27 @@ var (
 	imapErrorCount  int64
 )
 
-func IncrAppend()          { atomic.AddInt64(&imapAppendCount, 1) }
-func IncrError()           { atomic.AddInt64(&imapErrorCount, 1) }
+func IncrAppend()           { atomic.AddInt64(&imapAppendCount, 1) }
+func IncrError()            { atomic.AddInt64(&imapErrorCount, 1) }
 func GetAppendCount() int64 { return atomic.LoadInt64(&imapAppendCount) }
 func GetErrorCount() int64  { return atomic.LoadInt64(&imapErrorCount) }
-func ResetCounters() {
-	atomic.StoreInt64(&imapAppendCount, 0)
-	atomic.StoreInt64(&imapErrorCount, 0)
-}
 
 // ==========================================
 // TYPES
 // ==========================================
 
-type MessageMeta struct {
-	UID          uint32
-	Flags        []string
-	InternalDate time.Time
-	Subject      string
-	From         string
-	Date         string
-}
-
 type ErrAuthFailed struct{ Msg string }
 
 func (e *ErrAuthFailed) Error() string { return e.Msg }
+
+type ErrOperationTimeout struct {
+	Op      string
+	Timeout time.Duration
+}
+
+func (e *ErrOperationTimeout) Error() string {
+	return fmt.Sprintf("imap timeout %s (limit %s)", e.Op, e.Timeout)
+}
 
 type ConnectionLostError struct {
 	Op  string
@@ -78,24 +72,74 @@ func (e *ConnectionLostError) Error() string {
 }
 func (e *ConnectionLostError) Unwrap() error { return e.Err }
 
-type ErrOperationTimeout struct {
-	Op      string
-	Timeout time.Duration
-}
+// ==========================================
+// CONNECTION — go-imap v2
+// ==========================================
 
-func (e *ErrOperationTimeout) Error() string {
-	return fmt.Sprintf("imap timeout %s (limit %s)", e.Op, e.Timeout)
-}
+// ConnectAndAuth — TLS + XOAUTH2 через go-imap v2.
+// v2 поддерживает context.Context для всех операций.
+func ConnectAndAuth(ctx context.Context, email, token string) (*imapclient.Client, error) {
+	log.Printf("[INFO] [IMAP] ConnectAndAuth: email=%s host=%s", email, imapHost)
 
-func isConnectionLost(err error) bool {
-	if err == nil {
-		return false
+	start := time.Now()
+	conn, err := net.DialTimeout("tcp", imapHost, imapDialTimeout)
+	if err != nil {
+		return nil, fmt.Errorf("imap dial: %w", err)
 	}
-	msg := err.Error()
-	return strings.Contains(msg, "broken pipe") ||
-		strings.Contains(msg, "connection reset by peer") ||
-		strings.Contains(msg, "connection reset")
+
+	tlsServerName := imapHost
+	if idx := strings.LastIndex(imapHost, ":"); idx > 0 {
+		tlsServerName = imapHost[:idx]
+	}
+	tlsConn := tls.Client(conn, &tls.Config{ServerName: tlsServerName})
+	if err := tlsConn.Handshake(); err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("imap tls handshake: %w", err)
+	}
+	log.Printf("[DEBUG] [IMAP] TLS OK %s", time.Since(start))
+
+	c := imapclient.New(tlsConn, nil)
+
+	// Ждём greeting
+	if err := c.WaitGreeting(); err != nil {
+		c.Close()
+		return nil, fmt.Errorf("imap greeting: %w", err)
+	}
+
+	// XOAUTH2
+	saslClient := &xoauth2Client{email: email, token: token}
+	if err := c.Authenticate(saslClient); err != nil {
+		c.Close()
+		if isAuthError(err) {
+			return nil, &ErrAuthFailed{Msg: err.Error()}
+		}
+		return nil, fmt.Errorf("imap auth: %w", err)
+	}
+	log.Printf("[INFO] [IMAP] auth OK %s %s", email, time.Since(start))
+
+	return c, nil
 }
+
+// ==========================================
+// XOAUTH2 SASL
+// ==========================================
+
+type xoauth2Client struct {
+	email string
+	token string
+}
+
+func (a *xoauth2Client) Start() (mech string, ir []byte, err error) {
+	return "XOAUTH2", []byte(fmt.Sprintf("user=%s\x01auth=Bearer %s\x01\x01", a.email, a.token)), nil
+}
+
+func (a *xoauth2Client) Next(challenge []byte) (ir []byte, err error) {
+	return nil, fmt.Errorf("xoauth2: unexpected server challenge: %s", challenge)
+}
+
+// ==========================================
+// HELPERS
+// ==========================================
 
 func isAuthError(err error) bool {
 	if err == nil {
@@ -127,204 +171,16 @@ func filterOut(slice []string, exclude string) []string {
 	return result
 }
 
-// ==========================================
-// CONNECTION
-// ==========================================
-
-// ConnectAndAuth — TLS + XOAUTH2 with connection and operation timeouts.
-func ConnectAndAuth(email, token string) (*client.Client, error) {
-	log.Printf("[INFO] [IMAP] ConnectAndAuth: email=%s host=%s dialTimeout=%s imapTimeout=%s",
-		email, imapHost, imapDialTimeout, ImapTimeout)
-
-	start := time.Now()
-	conn, err := net.DialTimeout("tcp", imapHost, imapDialTimeout)
-	if err != nil {
-		log.Printf("[ERROR] [IMAP] ConnectAndAuth: dial failed %s: %v (%s)", email, err, time.Since(start))
-		return nil, fmt.Errorf("imap dial: %w", err)
-	}
-	log.Printf("[DEBUG] [IMAP] ConnectAndAuth: TCP dial OK %s %s", email, time.Since(start))
-
-	// TLS ServerName = хост без порта
-	tlsServerName := imapHost
-	if idx := strings.LastIndex(imapHost, ":"); idx > 0 {
-		tlsServerName = imapHost[:idx]
-	}
-	tlsConn := tls.Client(conn, &tls.Config{ServerName: tlsServerName})
-	if err := tlsConn.Handshake(); err != nil {
-		conn.Close()
-		return nil, fmt.Errorf("imap tls handshake: %w", err)
-	}
-	log.Printf("[DEBUG] [IMAP] ConnectAndAuth: TLS OK %s %s", email, time.Since(start))
-
-	tlsConn.SetDeadline(time.Now().Add(ImapTimeout))
-
-	c, err := client.New(tlsConn)
-	if err != nil {
-		tlsConn.Close()
-		return nil, fmt.Errorf("imap client: %w", err)
-	}
-
-	saslClient := &xoauth2Client{email: email, token: token}
-	if err := c.Authenticate(saslClient); err != nil {
-		c.Close()
-		if isAuthError(err) {
-			return nil, &ErrAuthFailed{Msg: err.Error()}
-		}
-		return nil, fmt.Errorf("imap auth: %w", err)
-	}
-	log.Printf("[INFO] [IMAP] ConnectAndAuth: auth OK %s %s", email, time.Since(start))
-
-	tlsConn.SetDeadline(time.Time{})
-	return c, nil
-}
-
-// ==========================================
-// IMAP OPERATIONS
-// ==========================================
-
-// withTimeout wraps a function with a context timeout.
-func withTimeout(ctx context.Context, op string, fn func() error) error {
-	ctx, cancel := context.WithTimeout(ctx, ImapTimeout)
-	defer cancel()
-	done := make(chan error, 1)
-	go func() { done <- fn() }()
-	select {
-	case err := <-done:
-		return err
-	case <-ctx.Done():
-		return &ErrOperationTimeout{Op: op, Timeout: ImapTimeout}
-	}
-}
-
-// Append appends a message to an IMAP folder.
-func Append(ctx context.Context, c *client.Client, folder string, dateFromHeader time.Time, rawMessage []byte, flags []string, msgID string) error {
-	enriched := injectMsgIDHeader(rawMessage, msgID)
-	err := withTimeout(ctx, "append to "+folder, func() error {
-		lit := bytes.NewReader(enriched)
-		return c.Append(folder, flags, dateFromHeader, lit)
-	})
-	if err != nil {
-		IncrError()
-		if isConnectionLost(err) {
-			return &ConnectionLostError{Op: "append to " + folder, Err: err}
-		}
-		return err
-	}
-	IncrAppend()
-	return nil
-}
-
-// searchByMsgID finds a UID by X-Gwsferry-MsgID header via IMAP SEARCH.
-func searchByMsgID(c *client.Client, folder, msgID string) uint32 {
-	state, err := c.Select(folder, true)
-	if err != nil {
-		return 0
-	}
-	_ = state
-
-	criteria := &imap.SearchCriteria{
-		Header: map[string][]string{
-			"X-Gwsferry-MsgID": {msgID},
-		},
-	}
-	uids, err := c.UidSearch(criteria)
-	if err != nil || len(uids) == 0 {
-		return 0
-	}
-	return uids[0]
-}
-
-// StoreFlag sets a flag by UID.
-func StoreFlag(c *client.Client, folder string, uid uint32, flag string) error {
-	return withTimeout(context.Background(), "store flag "+folder, func() error {
-		_, err := c.Select(folder, false)
-		if err != nil {
-			return fmt.Errorf("select %s: %w", folder, err)
-		}
-		seqSet := new(imap.SeqSet)
-		seqSet.Add(strconv.FormatUint(uint64(uid), 10))
-		item := imap.FormatFlagsOp(imap.AddFlags, true)
-		return c.UidStore(seqSet, item, []interface{}{flag}, nil)
-	})
-}
-
-// List returns messages from an IMAP folder.
-func List(ctx context.Context, c *client.Client, folder string) ([]MessageMeta, error) {
-	var result []MessageMeta
-	err := withTimeout(ctx, "list "+folder, func() error {
-		state, err := c.Select(folder, true)
-		if err != nil {
-			return fmt.Errorf("select %s: %w", folder, err)
-		}
-		if state.Messages == 0 {
-			return nil
-		}
-		seqSet := new(imap.SeqSet)
-		seqSet.Add("1:*")
-		messages := make(chan *imap.Message, 100)
-		done := make(chan error, 1)
-		go func() {
-			done <- c.UidFetch(seqSet, []imap.FetchItem{
-				imap.FetchUid,
-				imap.FetchFlags,
-				imap.FetchInternalDate,
-				imap.FetchEnvelope,
-			}, messages)
-		}()
-		for msg := range messages {
-			meta := MessageMeta{UID: msg.Uid, InternalDate: msg.InternalDate}
-			for _, f := range msg.Flags {
-				meta.Flags = append(meta.Flags, string(f))
-			}
-			if msg.Envelope != nil {
-				meta.Subject = msg.Envelope.Subject
-				if len(msg.Envelope.From) > 0 {
-					meta.From = msg.Envelope.From[0].Address()
-				}
-				meta.Date = msg.Envelope.Date.Format(time.RFC1123Z)
-			}
-			result = append(result, meta)
-		}
-		return <-done
-	})
-	if err != nil {
-		return nil, err
-	}
-	return result, nil
-}
-
-// Delete marks a message as \Deleted and expunges.
-func Delete(ctx context.Context, c *client.Client, folder string, uid uint32) error {
-	return withTimeout(ctx, "delete "+folder, func() error {
-		_, err := c.Select(folder, false)
-		if err != nil {
-			return fmt.Errorf("select %s: %w", folder, err)
-		}
-		seqSet := new(imap.SeqSet)
-		seqSet.Add(strconv.FormatUint(uint64(uid), 10))
-		item := imap.FormatFlagsOp(imap.AddFlags, true)
-		if err := c.UidStore(seqSet, item, []interface{}{imap.DeletedFlag}, nil); err != nil {
-			return fmt.Errorf("flag \\Deleted uid %d: %w", uid, err)
-		}
-		return c.Expunge(nil)
-	})
-}
-
-// injectMsgIDHeader adds X-Gwsferry-MsgID to RFC822 headers.
+// injectMsgIDHeader добавляет X-Gwsferry-MsgID в RFC822 заголовки.
 func injectMsgIDHeader(raw []byte, msgID string) []byte {
 	header := "\r\n" + fmt.Sprintf("X-Gwsferry-MsgID: %s\r\n", msgID)
-
-	// Ищем разделитель заголовков: \r\n\r\n (RFC 2822) или \n\n (non-standard)
 	idx := bytes.Index(raw, []byte("\r\n\r\n"))
 	if idx == -1 {
 		idx = bytes.Index(raw, []byte("\n\n"))
 	}
 	if idx == -1 {
-		// Ни один разделитель не найден — добавляем в конец
-		log.Printf("[DEBUG] [IMAP] injectMsgIDHeader: header-body separator не найден, добавляю в конец")
 		return append(raw, []byte(header+"\r\n")...)
 	}
-
 	result := make([]byte, 0, len(raw)+len(header))
 	result = append(result, raw[:idx]...)
 	result = append(result, []byte(header)...)
@@ -332,56 +188,17 @@ func injectMsgIDHeader(raw []byte, msgID string) []byte {
 	return result
 }
 
-// Close closes an IMAP connection.
-func Close(c *client.Client) {
-	if c != nil {
-		c.Logout()
-		c.Close()
+// FormatNumSet форматирует NumSet для логов.
+func formatNumSet(nums []imap.UID) string {
+	if len(nums) == 0 {
+		return "empty"
 	}
-}
-
-// CreateFolderIfNotExists checks if a folder exists and creates it if not.
-func CreateFolderIfNotExists(ctx context.Context, c *client.Client, folder string) error {
-	return withTimeout(ctx, "create folder "+folder, func() error {
-		mailboxes := make(chan *imap.MailboxInfo, 10)
-		done := make(chan error, 1)
-		go func() {
-			done <- c.List("", folder, mailboxes)
-		}()
-		exists := false
-		for range mailboxes {
-			exists = true
+	if len(nums) <= 3 {
+		s := make([]string, len(nums))
+		for i, u := range nums {
+			s[i] = strconv.FormatUint(uint64(u), 10)
 		}
-		if err := <-done; err != nil {
-			return fmt.Errorf("list folder %s: %w", folder, err)
-		}
-		if exists {
-			return nil
-		}
-		return c.Create(folder)
-	})
-}
-
-// DeleteFolder deletes an IMAP folder.
-func DeleteFolder(ctx context.Context, c *client.Client, folder string) error {
-	return withTimeout(ctx, "delete folder "+folder, func() error {
-		return c.Delete(folder)
-	})
-}
-
-// ==========================================
-// XOAUTH2 SASL
-// ==========================================
-
-type xoauth2Client struct {
-	email string
-	token string
-}
-
-func (a *xoauth2Client) Start() (mech string, ir []byte, err error) {
-	return "XOAUTH2", []byte(fmt.Sprintf("user=%s\x01auth=Bearer %s\x01\x01", a.email, a.token)), nil
-}
-
-func (a *xoauth2Client) Next(challenge []byte) (ir []byte, err error) {
-	return nil, fmt.Errorf("xoauth2: unexpected server challenge: %s", challenge)
+		return strings.Join(s, ",")
+	}
+	return fmt.Sprintf("%d items [%d...%d]", len(nums), nums[0], nums[len(nums)-1])
 }

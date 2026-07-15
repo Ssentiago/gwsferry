@@ -6,20 +6,20 @@ import (
 	"log"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"sync"
 	"syscall"
+	"time"
 
 	yandexapi "gwsferry/internal/gmail/import-yandex/api"
-	"gwsferry/internal/shared/config"
 	"gwsferry/internal/shared/dashboard"
+	"gwsferry/internal/shared/etatracker"
+	"gwsferry/internal/shared/util"
 )
 
-// OrchestratorParams — всё что нужно для запуска импорта.
+// OrchestratorParams — параметры для одного импорта source → target.
 type OrchestratorParams struct {
-	Users        []yandexapi.User
-	SourceEmail  string // откуда .eml в S3
-	TargetEmail  string // куда заливаем через IMAP
+	SourceUser   yandexapi.User
+	TargetUser   yandexapi.User
 	Labels       LabelsFile
 	S3           S3Reader
 	API          *yandexapi.API
@@ -27,164 +27,211 @@ type OrchestratorParams struct {
 	ClientSecret string
 }
 
-// MsgWorkers — hardcoded parallelism per user. Not configurable.
+// MsgWorkers — parallelism per user.
 const MsgWorkers = 25
 
-// Run запускает пайплайн импорта с resume и dashboard.
-func Run(ctx context.Context, params OrchestratorParams, cfg *config.Config, dash *dashboard.Dashboard) {
-	userWorkers := cfg.Yandex.UserWorkers
-	msgWorkers := MsgWorkers
-	statePath := cfg.StateFile
-	if statePath == "" {
-		statePath = "import_state.json"
-	}
-	if execPath, err := os.Executable(); err == nil {
-		statePath = filepath.Join(filepath.Dir(execPath), statePath)
-	}
+// UserReport — агрегированный отчёт по импорту.
+type UserReport struct {
+	Source    string
+	Target    string
+	Processed int
+	Failed    int
+	Skipped   int
+	Duration  time.Duration
+}
 
-	log.Printf("[INFO] [ORCH] запуск оркестратора: userWorkers=%d msgWorkers=%d statePath=%s",
-		userWorkers, msgWorkers, statePath)
-
-	// Загружаем состояние
-	log.Printf("[INFO] [ORCH] загружаю состояние из %s...", statePath)
-	st := loadImportState(statePath)
-	log.Printf("[INFO] [ORCH] состояние загружено: %d юзеров в state, %d юзеров с ошибками",
-		len(st.Users), len(st.Errors))
-	for email, status := range st.Users {
-		log.Printf("[DEBUG] [ORCH] state: %s → %s", email, status)
+func dashUpdate(dash *dashboard.Dashboard, key, task, status string) {
+	if dash != nil {
+		dash.UpdateWorker(key, task, status, "")
 	}
+}
 
-	// Фильтруем завершённых
-	var pending []yandexapi.User
-	for _, u := range params.Users {
-		if !st.isUserDone(u.Email) {
-			pending = append(pending, u)
-			log.Printf("[DEBUG] [ORCH] pending: %s (uid=%d)", u.Email, u.ID)
-		} else {
-			log.Printf("[DEBUG] [ORCH] skip (done): %s", u.Email)
+// RunUserImport — импорт писем из SOURCE в TARGET для одного пользователя.
+// Использует ShutdownFlag для graceful shutdown по SIGINT/SIGTERM.
+func RunUserImport(
+	ctx context.Context,
+	params OrchestratorParams,
+	st *ImportState,
+	statePath string,
+	dash *dashboard.Dashboard,
+	workerKey string,
+) {
+	start := time.Now()
+	report := UserReport{Source: params.SourceUser.Email, Target: params.TargetUser.Email}
+
+	// Shutdown coordination
+	shutdown := util.NewShutdownFlag()
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM, syscall.SIGWINCH)
+	go func() {
+		for sig := range sigCh {
+			switch sig {
+			case syscall.SIGWINCH:
+				if dash != nil {
+					dash.ForceRedraw()
+				}
+			case syscall.SIGINT, syscall.SIGTERM:
+				if shutdown.IsSet() {
+					continue
+				}
+				shutdown.Set()
+				log.Println("[WARN] [SHUTDOWN] Получен сигнал остановки - сохраняю состояние.")
+				go func() {
+					time.Sleep(5 * time.Second)
+					saveImportState(st, statePath)
+					log.Println("[WARN] [SHUTDOWN] Экстренный дамп выполнен.")
+					os.Exit(0)
+				}()
+			}
 		}
+	}()
+
+	log.Printf("[INFO] [USER] ======== ИМПОРТ %s → %s ========", params.SourceUser.Email, params.TargetUser.Email)
+
+	dashUpdate(dash, workerKey, "загрузка лейблов", "working")
+
+	// 1. BuildLetters
+	log.Printf("[INFO] [USER] загружаю письма из S3 (source=%s)...", params.SourceUser.Email)
+	letters, warnings, err := BuildLetters(ctx, params.S3, params.SourceUser.Email, params.Labels)
+	if err != nil {
+		log.Printf("[ERROR] [USER] BuildLetters failed: %v", err)
+		st.markUserError(params.SourceUser.Email, err.Error())
+		dashUpdate(dash, workerKey, "ошибка", "error")
+		report.Duration = time.Since(start)
+		return
 	}
+	report.Skipped = len(warnings)
+	log.Printf("[INFO] [USER] BuildLetters: %d писем, %d warnings", len(letters), len(warnings))
 
-	log.Printf("[INFO] [ORCH] фильтрация: %d всего, %d pending, %d done",
-		len(params.Users), len(pending), len(params.Users)-len(pending))
-
-	if len(pending) == 0 {
-		log.Printf("[INFO] [ORCH] все юзеры уже обработаны, выхожу")
+	if len(letters) == 0 {
+		log.Printf("[INFO] [USER] 0 писем, done")
+		st.markUserDone(params.SourceUser.Email)
+		dashUpdate(dash, workerKey, "0 писем", "done")
 		return
 	}
 
-	// Обновляем dashboard
-	if dash != nil {
-		dash.UpdateOverall(func(o *dashboard.OverallState) {
-			o.UsersTotal = len(params.Users)
-			o.UsersDone = len(params.Users) - len(pending)
-			o.UsersPending = len(pending)
-		})
+	// 2. Фильтруем по resume
+	var pending []Letter
+	for _, l := range letters {
+		if st.isMessageDone(params.SourceUser.Email, l.MsgID) {
+			report.Skipped++
+			continue
+		}
+		pending = append(pending, l)
+	}
+	totalLetters := len(letters)
+	stateSkipped := report.Skipped - len(warnings)
+	log.Printf("[INFO] [USER] к обработке %d/%d (resume skip %d)", len(pending), totalLetters, stateSkipped)
+
+	if len(pending) == 0 {
+		st.markUserDone(params.SourceUser.Email)
+		dashUpdate(dash, workerKey, fmt.Sprintf("%d/%d", totalLetters, totalLetters), "done")
+		return
 	}
 
-	// Очередь
-	userChan := make(chan yandexapi.User, len(pending))
-	for _, u := range pending {
-		userChan <- u
-		log.Printf("[DEBUG] [ORCH] добавлен в очередь: %s (uid=%d)", u.Email, u.ID)
+	dashUpdate(dash, workerKey, fmt.Sprintf("%d/%d", stateSkipped, totalLetters), "working")
+
+	// 3. Dedup — проверяем TARGET IMAP
+	folderSet := make(map[string]struct{})
+	for _, l := range pending {
+		folderSet[ResolveFolder(l.LabelIDs, l.LabelNames)] = struct{}{}
 	}
-	close(userChan)
-	log.Printf("[INFO] [ORCH] очередь создана: %d юзеров, channel cap=%d", len(pending), len(pending))
+	uniqueFolders := make([]string, 0, len(folderSet))
+	for f := range folderSet {
+		uniqueFolders = append(uniqueFolders, f)
+	}
+	log.Printf("[INFO] [USER] pre-fetch dedup в TARGET (%s) для %d папок", params.TargetUser.Email, len(uniqueFolders))
 
-	reportChan := make(chan UserReport, len(pending))
-
-	// Пул UserGoroutine
-	log.Printf("[INFO] [ORCH] запускаю %d user-воркеров...", userWorkers)
-	var wg sync.WaitGroup
-	for i := 0; i < userWorkers; i++ {
-		wg.Add(1)
-		go func(workerID int) {
-			defer wg.Done()
-			log.Printf("[DEBUG] [ORCH] user-воркер %d запущен", workerID)
-			runUserGoroutine(ctx, userChan, reportChan, st, params, msgWorkers, dash)
-			log.Printf("[DEBUG] [ORCH] user-воркер %d завершён", workerID)
-		}(i)
+	var existingIDs map[string]bool
+	preFetchWorker := NewImapWorker(params.TargetUser, params.API, params.ClientID, params.ClientSecret, &SharedToken{}, nil)
+	existingIDs, err = preFetchWorker.PreFetchExistingIDs(ctx, uniqueFolders)
+	preFetchWorker.Close()
+	if err != nil {
+		log.Printf("[WARN] [USER] pre-fetch failed (1/2): %v, retry...", err)
+		w2 := NewImapWorker(params.TargetUser, params.API, params.ClientID, params.ClientSecret, &SharedToken{}, nil)
+		existingIDs, err = w2.PreFetchExistingIDs(ctx, uniqueFolders)
+		w2.Close()
+		if err != nil {
+			log.Printf("[WARN] [USER] pre-fetch failed (2/2): %v, без дедупа", err)
+			existingIDs = nil
+		}
 	}
 
-	go func() {
-		wg.Wait()
-		log.Printf("[INFO] [ORCH] все user-воркеры завершены, закрываю reportChan")
-		close(reportChan)
-	}()
+	var filtered []Letter
+	skippedByServer := 0
+	for _, l := range pending {
+		if existingIDs != nil && existingIDs[l.MsgID] {
+			skippedByServer++
+			continue
+		}
+		filtered = append(filtered, l)
+	}
+	if skippedByServer > 0 {
+		log.Printf("[INFO] [USER] пропущено %d (уже в TARGET), к обработке %d", skippedByServer, len(filtered))
+		report.Skipped += skippedByServer
+		stateSkipped += skippedByServer
+	}
+	pending = filtered
 
-	// Периодический дамп state
-	log.Printf("[INFO] [ORCH] запускаю периодический дамп state каждые 60с в %s", statePath)
-	stopDumper := startPeriodicDumper(st, statePath)
-	defer stopDumper()
+	if len(pending) == 0 {
+		st.markUserDone(params.SourceUser.Email)
+		dashUpdate(dash, workerKey, fmt.Sprintf("%d/%d", totalLetters, totalLetters), "done")
+		return
+	}
 
-	// SIGINT/SIGTERM handler
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-	go func() {
-		sig := <-sigCh
-		log.Printf("[WARN] [ORCH] получен сигнал %v, сохраняю состояние...", sig)
-		saveImportState(st, statePath)
-		log.Printf("[WARN] [ORCH] состояние сохранено, выхожу")
-		os.Exit(0)
-	}()
+	dashUpdate(dash, workerKey, fmt.Sprintf("%d/%d", stateSkipped, totalLetters), "working")
 
-	// Чтение отчётов
-	log.Printf("[INFO] [ORCH] жду отчёты от юзеров...")
-	var totalProcessed, totalFailed, totalSkipped int
-	for report := range reportChan {
-		totalProcessed += report.Processed
-		totalFailed += report.Failed
-		totalSkipped += report.Skipped
+	// 4. Append — заливаем в TARGET IMAP
+	taskChan := make(chan LetterTask, len(pending))
+	for _, l := range pending {
+		taskChan <- LetterTask{Letter: l}
+	}
+	close(taskChan)
 
-		log.Printf("[INFO] [ORCH] отчёт от %s: processed=%d failed=%d skipped=%d duration=%s",
-			report.Email, report.Processed, report.Failed, report.Skipped, report.Duration)
+	sharedToken := &SharedToken{}
+	createdFolders := &sync.Map{}
+	msgReportChan := make(chan MessageReport, len(pending))
 
-		// Обновляем state
-		if report.Failed > 0 {
-			st.markUserError(report.Email, "failed")
-			log.Printf("[WARN] [ORCH] %s: помечен как error (failed=%d)", report.Email, report.Failed)
+	eta := etatracker.New(0.3)
+	eta.Record(0)
+
+	for i := 0; i < MsgWorkers; i++ {
+		go func() {
+			worker := NewImapWorker(params.TargetUser, params.API, params.ClientID, params.ClientSecret, sharedToken, createdFolders)
+			runMessagesGoroutine(ctx, params.S3, worker, taskChan, msgReportChan)
+			worker.Close()
+		}()
+	}
+
+	for mr := range msgReportChan {
+		if mr.Err != nil {
+			report.Failed++
 		} else {
-			st.markUserDone(report.Email)
-			log.Printf("[INFO] [ORCH] %s: помечен как done", report.Email)
+			report.Processed++
+			st.markMessageDone(params.SourceUser.Email, mr.MsgID)
 		}
+		eta.Record(1)
+		done := stateSkipped + report.Processed + report.Failed
+		remaining := totalLetters - done
+		etaStr := etatracker.FormatETA(eta.EstimateSeconds(remaining))
+		dash.UpdateWorker(workerKey,
+			fmt.Sprintf("%d/%d", done, totalLetters),
+			"working", etaStr)
+	}
+
+	if report.Failed > 0 {
+		st.markUserError(params.SourceUser.Email, fmt.Sprintf("%d failed", report.Failed))
+		dashUpdate(dash, workerKey, fmt.Sprintf("%d/%d ok, %d failed", stateSkipped+report.Processed, totalLetters, report.Failed), "error")
+	} else {
+		st.markUserDone(params.SourceUser.Email)
+		dashUpdate(dash, workerKey, fmt.Sprintf("%d/%d", totalLetters, totalLetters), "done")
+	}
+
+	log.Printf("[INFO] [USER] ======== ГОТОВО %s → %s: %d ok, %d failed, %d skipped, %s ========",
+		params.SourceUser.Email, params.TargetUser.Email,
+		report.Processed, report.Failed, report.Skipped, time.Since(start))
+
+	if statePath != "" {
 		saveImportState(st, statePath)
-		log.Printf("[DEBUG] [ORCH] state сохранён после %s", report.Email)
-
-		// Обновляем dashboard
-		if dash != nil {
-			dash.UpdateOverall(func(o *dashboard.OverallState) {
-				o.UsersDone++
-				if report.Failed > 0 {
-					o.UsersError++
-					o.UsersPending--
-				} else {
-					o.UsersPending--
-				}
-			})
-			dash.Log(levelFromReport(report), formatReport(report))
-		}
 	}
-
-	// Финальное сохранение
-	saveImportState(st, statePath)
-
-	log.Printf("[INFO] [ORCH] завершено: %d обработано, %d ошибок, %d пропущено (из %d)",
-		totalProcessed, totalFailed, totalSkipped, len(params.Users))
-}
-
-func formatReport(r UserReport) string {
-	if r.Failed > 0 {
-		return fmt.Sprintf("%s: %d ok, %d failed (%s)", r.Email, r.Processed, r.Failed, r.Duration)
-	}
-	return fmt.Sprintf("%s: %d писем (%s)", r.Email, r.Processed, r.Duration)
-}
-
-func levelFromReport(r UserReport) string {
-	if r.Failed > 0 {
-		return "ERROR"
-	}
-	if r.Skipped > 0 {
-		return "WARN"
-	}
-	return "INFO"
 }
