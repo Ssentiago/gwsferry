@@ -201,6 +201,7 @@ func RunImport(cfg *config.Config, sourceEmail, targetEmail string) error {
 		}
 		dash.UpdateWorker(key, "в очереди", "idle", "")
 	}
+	dash.Flush() // принудительная отрисовка начального состояния
 
 	// 10. Запуск
 	for _, t := range tasks {

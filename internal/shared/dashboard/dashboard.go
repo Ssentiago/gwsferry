@@ -170,6 +170,13 @@ func (d *Dashboard) Log(level, msg string) {
 	d.redraw()
 }
 
+// Flush принудительно перерисовывает дашборд, сбрасывая throttle.
+// Использовать после массовой регистрации воркеров, чтобы показать начальное состояние.
+func (d *Dashboard) Flush() {
+	d.lastRedraw = time.Time{} // сбрасываем throttle
+	d.redraw()
+}
+
 func (d *Dashboard) redraw() {
 	// Throttle: не перерисовываем чаще чем redrawDelay
 	now := time.Now()
