@@ -76,7 +76,7 @@ func loadEmails(filePath string) ([]string, error) {
 	var asArray struct {
 		Users []string `json:"users"`
 	}
-	if err := json.Unmarshal(raw, &asArray); err == nil && len(asArray.Users) > 0 {
+	if err := json.Unmarshal(raw, &asArray); err == nil {
 		return dedup(asArray.Users), nil
 	}
 
@@ -84,7 +84,7 @@ func loadEmails(filePath string) ([]string, error) {
 	var asObject struct {
 		Users map[string]json.RawMessage `json:"users"`
 	}
-	if err := json.Unmarshal(raw, &asObject); err == nil && len(asObject.Users) > 0 {
+	if err := json.Unmarshal(raw, &asObject); err == nil {
 		var emails []string
 		for email := range asObject.Users {
 			emails = append(emails, email)
@@ -96,7 +96,7 @@ func loadEmails(filePath string) ([]string, error) {
 	var asSlice []struct {
 		Email string `json:"email"`
 	}
-	if err := json.Unmarshal(raw, &asSlice); err == nil && len(asSlice) > 0 {
+	if err := json.Unmarshal(raw, &asSlice); err == nil {
 		var emails []string
 		for _, u := range asSlice {
 			if u.Email != "" {
