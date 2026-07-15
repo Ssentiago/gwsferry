@@ -29,7 +29,7 @@ func RunImport(cfg *config.Config, sourceEmail, targetEmail string) error {
 	}
 
 	fmt.Println()
-	pterm.DefaultSection.Println("Yandex → IMAP импорт")
+	pterm.DefaultSection.Println("Gmail S3 → Yandex IMAP импорт")
 
 	if cfg.ImapHost != "" {
 		SetImapHost(cfg.ImapHost)
